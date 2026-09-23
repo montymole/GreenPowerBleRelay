@@ -1,0 +1,31 @@
+# PlatformIO build output
+.pio/
+
+# Arduino CLI build output
+build/
+arduino_build_*/
+
+# Compiled firmware and upload artifacts
+*.bin
+*.elf
+*.hex
+*.map
+*.eep
+*.uf2
+
+# PlatformIO / Arduino generated metadata
+.clangd
+compile_commands.json
+*.ino.cpp
+
+# Editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+*.swo
