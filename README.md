@@ -3,7 +3,7 @@
 Minimal ESP32 firmware that connects to the GreenPower BLE device and exposes a small REST API over Wi-Fi.
 
 ## Note
-A quick AI generated attempt is to make BLE  of Chinese GreenPower  MPTT controller
+A quick AI generated attempt is to make BLE  of Chinese GreenPower wind/solar controller 
 registers possible to read write to via rest-api Esp32 acting a bridge.
 
 Details of device BLE are extracted from Android application.
