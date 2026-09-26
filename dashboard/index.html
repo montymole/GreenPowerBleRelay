@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>BLE Relay Console</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script type="module" src="/app.js"></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/">BLE<span>Relay</span></a>
+      <div class="connection">
+        <label for="base-url">Relay URL</label>
+        <input id="base-url" type="url" value="http://192.168.10.130" spellcheck="false">
+        <label for="api-key">API key</label>
+        <input id="api-key" type="password" placeholder="Required for writes" autocomplete="off">
+        <button id="save-settings" class="button secondary">Save</button>
+      </div>
+    </header>
+
+    <main>
+      <section class="hero">
+        <div>
+          <p class="eyebrow">LOCAL DEVICE CONTROL</p>
+          <h1>Relay console</h1>
+          <p class="muted">Monitor health, discover BLE devices, and use the relay API.</p>
+        </div>
+        <div class="hero-actions">
+          <span id="connection-state" class="pill neutral">Connecting</span>
+          <button id="refresh-all" class="button secondary">Refresh</button>
+        </div>
+      </section>
+
+      <section class="health-grid" aria-label="Relay health">
+        <article class="health-card"><span>Relay health</span><strong id="health-state">—</strong><small id="health-code">Waiting for response</small></article>
+        <article class="health-card"><span>Wi-Fi</span><strong id="wifi-state">—</strong><small id="wifi-detail">—</small></article>
+        <article class="health-card"><span>GreenPower GATT</span><strong id="ble-state">—</strong><small id="ble-detail">—</small></article>
+        <article class="health-card"><span>Uptime</span><strong id="uptime">—</strong><small id="last-error">Last error: —</small></article>
+      </section>
+
+      <div class="columns">
+        <section class="panel">
+          <div class="panel-heading">
+            <div><p class="eyebrow">PASSIVE BLE SCAN</p><h2>Discovery</h2></div>
+            <div class="scan-controls">
+              <label for="scan-duration">Duration
+                <select id="scan-duration">
+                  <option value="8">8 seconds</option>
+                  <option value="15">15 seconds</option>
+                  <option value="30" selected>30 seconds</option>
+                  <option value="60">60 seconds</option>
+                </select>
+              </label>
+              <button id="scan-button" class="button primary">Start scan</button>
+            </div>
+          </div>
+          <div id="scan-state" class="scan-state"><span class="pulse"></span><span>Not scanning</span></div>
+          <div id="discovery-list" class="empty">No discovered devices yet. Start a scan to look for GreenPower and Victron advertisements.</div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-heading">
+            <div><p class="eyebrow">DEVICE REGISTRY</p><h2>Configured devices</h2></div>
+            <button id="refresh-devices" class="button secondary">Refresh</button>
+          </div>
+          <div id="device-list" class="empty">Loading configured devices…</div>
+          <form id="add-device-form" class="form-grid">
+            <h3>Add device manually</h3>
+            <label>BLE address<input name="address" placeholder="AA:BB:CC:DD:EE:FF" required></label>
+            <label>Protocol<select name="protocol"><option value="victron">Victron advertisement</option><option value="greenpower">GreenPower GATT</option></select></label>
+            <label>Name<input name="name" placeholder="Optional friendly name"></label>
+            <label class="victron-key-field">Victron key<input name="key" placeholder="32 hex characters" minlength="32" maxlength="32" autocomplete="off"></label>
+            <button class="button primary" type="submit">Add device</button>
+          </form>
+        </section>
+      </div>
+
+      <section class="panel">
+        <div class="panel-heading">
+          <div><p class="eyebrow">FIRMWARE DIAGNOSTICS</p><h2>Recent logs</h2></div>
+          <button id="refresh-logs" class="button secondary">Refresh logs</button>
+        </div>
+        <p class="muted help-text">GET /api/v1/logs · Includes recent state changes and rate-limited BLE advertisement sightings.</p>
+        <pre id="logs-output" class="output muted">Loading recent logs…</pre>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading">
+          <div><p class="eyebrow">GREENPOWER TELEMETRY</p><h2>Live data</h2></div>
+          <button id="load-live" class="button secondary">Load /api/v1/live</button>
+        </div>
+        <pre id="live-output" class="output muted">No live data loaded.</pre>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading">
+          <div><p class="eyebrow">REGISTER API</p><h2>Read and write registers</h2></div>
+        </div>
+        <div class="tool-grid">
+          <form id="register-read-form" class="form-grid compact">
+            <h3>Read registers</h3>
+            <label>Start address<input name="start" value="0x0003" required></label>
+            <label>Count (1–31)<input name="count" type="number" min="1" max="31" value="28" required></label>
+            <button class="button secondary">Read</button>
+          </form>
+          <form id="register-write-form" class="form-grid compact">
+            <h3>Write register</h3>
+            <label>Address<input name="address" value="0x3001" required></label>
+            <label>Value<input name="value" type="number" min="0" max="65535" value="1" required></label>
+            <button class="button warning">Write (API key required)</button>
+          </form>
+        </div>
+        <pre id="register-output" class="output muted">Register responses appear here.</pre>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading">
+          <div><p class="eyebrow">NAMED CONFIGURATION</p><h2>GreenPower configuration</h2></div>
+        </div>
+        <form id="config-form" class="inline-form">
+          <label>Configuration<select name="kind"><option>battery</option><option>system</option><option>pv</option><option>fan</option><option>output</option></select></label>
+          <button class="button secondary" name="action" value="read">Read</button>
+          <button class="button warning" name="action" value="write">Write JSON (API key required)</button>
+        </form>
+        <label class="json-label">JSON body for writes<textarea id="config-body" rows="3" spellcheck="false" placeholder='{"mpptEnabled":true,"maxRpm":1200}'></textarea></label>
+        <pre id="config-output" class="output muted">Configuration responses appear here.</pre>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading">
+          <div><p class="eyebrow">REST CLIENT</p><h2>API explorer</h2></div>
+        </div>
+        <form id="api-form" class="api-form">
+          <label>Method<select name="method"><option>GET</option><option>POST</option><option>PUT</option><option>PATCH</option><option>DELETE</option></select></label>
+          <label class="path-field">Path<input name="path" value="/api/v1/status" placeholder="/api/v1/..." required></label>
+          <button class="button primary">Send</button>
+        </form>
+        <label class="json-label">Optional JSON body<textarea id="api-body" rows="3" spellcheck="false" placeholder='{"value":1}'></textarea></label>
+        <pre id="api-output" class="output muted">API response appears here.</pre>
+      </section>
+
+      <footer>Refreshes health and device state automatically. Mutating requests require the configured API key.</footer>
+    </main>
+    <div id="toast" role="status" aria-live="polite"></div>
+  </body>
+</html>

@@ -21,11 +21,9 @@ fi
 
 echo "Building and uploading to $PORT"
 
-FQBN="esp32:esp32:esp32:PartitionScheme=min_spiffs"
+FQBN="esp32:esp32:esp32c3:PartitionScheme=min_spiffs,CDCOnBoot=cdc"
 
-if command -v pio >/dev/null 2>&1; then
-  pio run --target upload --upload-port "$PORT"
-else
-  arduino-cli compile --fqbn "$FQBN" .
-  arduino-cli upload --fqbn "$FQBN" --port "$PORT" .
-fi
+# The ESP32-C3 is connected through native USB. The Arduino CLI board options
+# enable USB CDC on boot so Serial output is available over USB.
+arduino-cli compile --fqbn "$FQBN" .
+arduino-cli upload --fqbn "$FQBN" --port "$PORT" .
