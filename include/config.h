@@ -2,7 +2,7 @@
 
 // Keep this simple for the first build: bake network/API settings into firmware.
 // Replace these values before flashing.
-#define WIFI_SSID "T121"
+#define WIFI_SSID "Tarsele2"
 #define WIFI_PASSWORD "singingbowl"
 #define API_KEY "windcontrol"
 

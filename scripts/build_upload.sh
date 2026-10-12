@@ -4,6 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 PORT="${1:-}"
+ENVIRONMENT="${2:-}"
 
 if [[ -z "$PORT" ]]; then
   if command -v pio >/dev/null 2>&1; then
@@ -20,6 +21,21 @@ if [[ -z "$PORT" ]]; then
 fi
 
 echo "Building and uploading to $PORT"
+
+if [[ "$ENVIRONMENT" == "esp32-c6-lcd-147" ]]; then
+  if ! command -v pio >/dev/null 2>&1; then
+    echo "PlatformIO is required for the ESP32-C6 target." >&2
+    exit 1
+  fi
+  pio run --environment "$ENVIRONMENT" --target upload --upload-port "$PORT"
+  exit 0
+fi
+
+if [[ -n "$ENVIRONMENT" ]]; then
+  echo "Unsupported PlatformIO environment: $ENVIRONMENT" >&2
+  echo "Supported environment: esp32-c6-lcd-147" >&2
+  exit 1
+fi
 
 FQBN="esp32:esp32:esp32c3:PartitionScheme=min_spiffs,CDCOnBoot=cdc"
 

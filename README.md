@@ -13,6 +13,9 @@ Edit `include/config.h`:
 #define API_KEY "..."
 ```
 
+For hardware details and Waveshare firmware/documentation links, see
+[`HARDWARE_ESP32-C6-LCD-1.47.md`](HARDWARE_ESP32-C6-LCD-1.47.md).
+
 ## Build and Upload
 
 ```bash
@@ -25,6 +28,27 @@ Or pass a serial port:
 ```bash
 ./scripts/build_upload.sh /dev/cu.usbserial-0001
 ```
+
+For the Waveshare ESP32-C6-LCD-1.47, use its PlatformIO environment:
+
+```bash
+./scripts/build_upload.sh /dev/cu.usbmodem1101 esp32-c6-lcd-147
+```
+
+This C6 target shows the configured/connected Wi-Fi network name, Wi-Fi status/IP,
+BLE readiness and overall relay status on the LCD. Its RGB LED pulses blue/turquoise
+while connecting, scanning or exchanging Modbus data, turns green when ready, and
+red when a connection or transaction has failed. The LCD's relay indicator follows
+the same state. A successful BLE initialization or transaction clears its previous
+error. LCD backlight and RGB brightness are limited for this board.
+
+Wi-Fi maintenance and display updates run independently of BLE operations. A Wi-Fi
+attempt has 30 seconds to finish, followed by a 5-second pause before retrying;
+a lost connection triggers an immediate reconnect attempt. BLE retries continue
+without Wi-Fi and wait 15 seconds after an automatic attempt finishes. Modbus
+timeouts also trigger BLE reinitialization. Neither connection requires the other
+to come up first.
+The existing default upload command continues to target the ESP32-C3.
 
 ## API
 
@@ -45,8 +69,8 @@ for authenticated device and configuration changes; it remains in the current
 browser tab's session storage. Browser access from a different origin requires
 the firmware's API CORS preflight support, included in this firmware.
 
-The ESP32-C3 PlatformIO build enables USB CDC on boot so `Serial` output is
-available through the board's native USB serial/JTAG port.
+The ESP32-C3 and ESP32-C6 PlatformIO builds enable USB CDC on boot so `Serial`
+output is available through the board's native USB serial/JTAG port.
 
 ### Discovery and device registry
 

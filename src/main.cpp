@@ -7,9 +7,12 @@
 #include <Preferences.h>
 #include <string>
 #include <vector>
+#include <atomic>
 
 #include "../include/config.h"
 #include "../include/victron_ble.h"
+#include "status_display.h"
+#include "connection_state.h"
 
 static const char *SERVICE_UUID = "0000FFB0-0000-1000-8000-00805F9B34FB";
 static const char *WRITE_UUID = "0000FFB1-0000-1000-8000-00805F9B34FB";
@@ -23,15 +26,17 @@ BLERemoteCharacteristic *writeChar = nullptr;
 BLERemoteCharacteristic *notifyChar = nullptr;
 
 std::vector<uint8_t> rxBuf;
-volatile bool bleConnected = false;
-bool deviceReady = false;
-bool transactionBusy = false;
+std::atomic<bool> bleConnected{false};
+std::atomic<bool> bleConnecting{false};
+std::atomic<bool> wifiConnecting{false};
+std::atomic<bool> deviceReady{false};
+std::atomic<bool> transactionBusy{false};
 uint8_t slaveAddress = 0x02;
 String lastError;
 String deviceName;
 String deviceAddress;
 uint32_t lastSeenMs = 0;
-uint32_t lastWifiStatusLog = 0;
+std::atomic<bool> transactionError{false};
 uint32_t lastBleRetryLog = 0;
 
 static constexpr size_t MAX_CONFIGURED_DEVICES = 8;
@@ -90,7 +95,7 @@ size_t recentLogNext = 0;
 size_t recentLogCount = 0;
 volatile uint32_t scanAdvertisementCount = 0;
 Preferences devicePreferences;
-bool discoveryRunning = false;
+std::atomic<bool> discoveryRunning{false};
 uint32_t discoveryStartedAt = 0;
 bool connectScanActive = false;
 uint32_t lastAdvertisementScan = 0;
@@ -478,17 +483,17 @@ class ClientCallbacks : public BLEClientCallbacks {
   void onDisconnect(BLEClient *) override {
     bleConnected = false;
     deviceReady = false;
-    writeChar = nullptr;
-    notifyChar = nullptr;
-    lastError = "ble_disconnected";
+    // The main task owns characteristic pointers. Clearing them here could
+    // race with an initialization write immediately after a delay.
     logState("ble_disconnected");
   }
 };
 
 static bool connectBle() {
-  logState("ble_scan_start", "timeout=10s");
   deviceReady = false;
   lastError = "";
+  bleConnecting = true;
+  logState("ble_scan_start", "timeout=10s");
   rxBuf.clear();
 
   if (bleClient && bleClient->isConnected()) bleClient->disconnect();
@@ -514,26 +519,34 @@ static bool connectBle() {
   if (!foundDevice) {
     lastError = "device_not_found";
     logState("ble_scan_failed", lastError);
+    bleConnecting = false;
     return false;
   }
 
   deviceName = foundDevice->haveName() ? foundDevice->getName().c_str() : "";
   deviceAddress = foundDevice->getAddress().toString().c_str();
 
-  bleClient = BLEDevice::createClient();
-  bleClient->setClientCallbacks(new ClientCallbacks());
+  static ClientCallbacks clientCallbacks;
+  if (!bleClient) {
+    bleClient = BLEDevice::createClient();
+    bleClient->setClientCallbacks(&clientCallbacks);
+  }
   logState("ble_connect_start", deviceAddress);
   if (!bleClient->connect(foundDevice)) {
     lastError = "connect_failed";
     logState("ble_connect_failed", lastError);
+    bleConnecting = false;
     return false;
   }
   bleConnected = true;
 
+  // Refresh cached services when reconnecting or switching devices.
+  bleClient->getServices();
   BLERemoteService *service = bleClient->getService(BLEUUID(SERVICE_UUID));
   if (!service) {
     lastError = "service_missing";
     logState("ble_setup_failed", lastError);
+    bleConnecting = false;
     return false;
   }
 
@@ -542,6 +555,7 @@ static bool connectBle() {
   if (!writeChar || !notifyChar) {
     lastError = "characteristic_missing";
     logState("ble_setup_failed", lastError);
+    bleConnecting = false;
     return false;
   }
 
@@ -551,17 +565,27 @@ static bool connectBle() {
   } else {
     lastError = "notify_not_supported";
     logState("ble_setup_failed", lastError);
+    bleConnecting = false;
     return false;
   }
   delay(200);
 
+  auto stillConnected = []() {
+    if (bleConnected) return true;
+    lastError = "ble_disconnected";
+    bleConnecting = false;
+    return false;
+  };
+  if (!stillConnected()) return false;
   logState("ble_enter_at_mode");
   writeChar->writeValue((uint8_t *)"+++", 3, false);
   delay(250);
+  if (!stillConnected()) return false;
   const char exitAt[] = "AT+exit\r\n";
   logState("ble_exit_at_mode");
   writeChar->writeValue((uint8_t *)exitAt, sizeof(exitAt) - 1, false);
   delay(250);
+  if (!stillConnected()) return false;
 
   std::vector<uint8_t> readAddress = {0xff, 0x03, 0xf0, 0x01, 0x00, 0x01, 0xf3, 0x14};
   rxBuf.clear();
@@ -569,25 +593,31 @@ static bool connectBle() {
   writeChar->writeValue(readAddress.data(), readAddress.size(), false);
 
   uint32_t start = millis();
-  while (millis() - start < 5000) {
+  while (bleConnected && millis() - start < 5000) {
     if (rxBuf.size() >= 7 && rxBuf[1] == 0x03) {
       std::vector<uint8_t> frame(rxBuf.begin(), rxBuf.begin() + 7);
       if (!crcOk(frame)) {
         lastError = "modbus_address_crc_invalid";
         logState("ble_init_failed", lastError);
+        bleConnecting = false;
         return false;
       }
       slaveAddress = frame[0];
+      if (!bleConnected) break;
+      lastError = "";
+      transactionError = false;
       deviceReady = true;
       lastSeenMs = millis();
       logState("ble_ready", "modbus_slave=0x" + hexByte(slaveAddress));
+      bleConnecting = false;
       return true;
     }
     delay(5);
   }
 
-  lastError = "modbus_address_timeout";
+  lastError = bleConnected ? "modbus_address_timeout" : "ble_disconnected";
   logState("ble_init_failed", lastError);
+  bleConnecting = false;
   return false;
 }
 
@@ -637,16 +667,22 @@ static TxResult transact(const std::vector<uint8_t> &request, uint8_t expectedFu
       if (!crcOk(r.response)) {
         r.error = "crc_invalid";
         logState("modbus_failed", r.error);
+        lastError = r.error;
+        transactionError = true;
         transactionBusy = false;
         return r;
       }
       if (r.response[1] & 0x80) {
         r.error = "modbus_exception";
         logState("modbus_failed", r.error);
+        lastError = r.error;
+        transactionError = true;
         transactionBusy = false;
         return r;
       }
       r.ok = true;
+      lastError = "";
+      transactionError = false;
       Serial.printf("[MODBUS] response ok bytes=%u\n", (unsigned)r.response.size());
       transactionBusy = false;
       return r;
@@ -655,6 +691,9 @@ static TxResult transact(const std::vector<uint8_t> &request, uint8_t expectedFu
   }
 
   r.error = "timeout";
+  lastError = r.error;
+  transactionError = true;
+  deviceReady = false;  // Reinitialize an unresponsive GATT/Modbus connection.
   logState("modbus_failed", r.error);
   transactionBusy = false;
   return r;
@@ -1446,15 +1485,17 @@ static bool liveJson(String &json, String &error) {
   float pvCurrent = reg(a.registers, 8) / 10.0f;
   float fanVoltage = reg(a.registers, 9) / 10.0f;
   float fanCurrent = reg(a.registers, 10) / 10.0f;
-  float workTemp = (reg(a.registers, 12) - 500) / 10.0f;
-  float battTemp = (reg(a.registers, 13) - 500) / 10.0f;
+  auto temperatureJson = [](uint16_t raw) -> String {
+    // 9999 means disabled (battery) or abnormal (work temperature).
+    return raw == 9999 ? String("null") : String((raw - 500) / 10.0f, 1);
+  };
 
   json = "{";
   json += "\"battery\":{\"status\":" + String(reg(a.registers, 1));
   json += ",\"percent\":" + String(reg(a.registers, 2));
   json += ",\"voltage\":" + String(batteryVoltage, 1);
   json += ",\"current\":" + String(batteryCurrent, 1);
-  json += ",\"temperature\":" + String(battTemp, 1);
+  json += ",\"temperature\":" + temperatureJson(reg(a.registers, 13));
   json += ",\"power\":" + String(reg(b.registers, 2)) + "},";
   json += "\"pv\":{\"day\":" + String(reg(a.registers, 6) ? "true" : "false");
   json += ",\"voltage\":" + String(pvVoltage, 1);
@@ -1469,7 +1510,7 @@ static bool liveJson(String &json, String &error) {
   json += "\"output\":{\"voltage\":" + String(reg(a.registers, 27) / 10.0f, 1);
   json += ",\"power\":" + String(reg(b.registers, 3)) + "},";
   json += "\"system\":{\"errorCode\":" + String(reg(a.registers, 0));
-  json += ",\"workTemperature\":" + String(workTemp, 1) + "}";
+  json += ",\"workTemperature\":" + temperatureJson(reg(a.registers, 12)) + "}";
   json += "}";
   return true;
 }
@@ -1672,6 +1713,43 @@ static void setupRoutes() {
   });
 }
 
+// Independent of the BLE/HTTP loop: allow each Wi-Fi attempt time to finish.
+static void connectionStatusTask(void *) {
+  WifiRetryState retry;
+  bool wasConnected = false;
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(false);  // This task is the sole retry scheduler.
+  for (;;) {
+    const bool connected = WiFi.status() == WL_CONNECTED;
+    if (connected && !wasConnected) logState("wifi_ready", "ip=" + WiFi.localIP().toString());
+    if (!connected && wasConnected) logState("wifi_disconnected");
+    switch (retry.update(millis(), connected)) {
+      case WifiAction::Begin:
+        logState("wifi_connect_start", "ssid=" WIFI_SSID);
+        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+        break;
+      case WifiAction::Reconnect:
+        logState("wifi_reconnect_attempt");
+        WiFi.reconnect();
+        break;
+      case WifiAction::Disconnect:
+        logState("wifi_connect_timeout", wifiStatusName(WiFi.status()));
+        WiFi.disconnect();
+        break;
+      case WifiAction::None:
+        break;
+    }
+    wasConnected = connected;
+    wifiConnecting = retry.connecting();
+    statusDisplayUpdate(connected, wifiConnecting,
+                        connected ? WiFi.SSID() : String(WIFI_SSID),
+                        connected ? WiFi.localIP().toString() : "",
+                        bleConnected, deviceReady, bleConnecting,
+                        transactionBusy || discoveryRunning, transactionError);
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   uint32_t serialWaitStart = millis();
@@ -1687,29 +1765,13 @@ void setup() {
   Serial.flush();
   logState("boot", "serial=115200");
 
+  statusDisplayInit();
   loadDeviceRegistry();
-  WiFi.mode(WIFI_STA);
-  Serial.println("[WIFI] using DHCP");
-  logState("wifi_connect_start", "ssid=" WIFI_SSID);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  uint32_t wifiStart = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 30000) {
-    delay(500);
-    if (millis() - lastWifiStatusLog >= 5000) {
-      lastWifiStatusLog = millis();
-      Serial.printf("[WIFI] status=%s elapsed=%lus\n",
-                    wifiStatusName(WiFi.status()),
-                    (unsigned long)((millis() - wifiStart) / 1000));
-    }
-  }
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.print("[WIFI] connected, IP=");
-    Serial.println(WiFi.localIP());
-    Serial.printf("[WIFI] RSSI=%d dBm\n", WiFi.RSSI());
-    logState("wifi_ready");
-  } else {
-    lastError = "wifi_connect_timeout";
-    logState("wifi_failed", String(wifiStatusName(WiFi.status())));
+  // This task owns Wi-Fi retries and all display writes, including while BLE blocks.
+  if (xTaskCreate(connectionStatusTask, "connection-status", 4096, nullptr, 1, nullptr) != pdPASS) {
+    Serial.println("[ERROR] Unable to start connection status task");
+    delay(1000);
+    ESP.restart();
   }
 
   logState("ble_init");
@@ -1740,7 +1802,6 @@ void loop() {
 
   static uint32_t lastReconnectAttempt = 0;
   if ((!bleConnected || !deviceReady) && millis() - lastReconnectAttempt > 15000) {
-    lastReconnectAttempt = millis();
     if (millis() - lastBleRetryLog >= 15000) {
       lastBleRetryLog = millis();
       logState("ble_reconnect_attempt", lastError);
@@ -1748,14 +1809,8 @@ void loop() {
     if (connectBle()) {
       logState("ble_reconnect_success");
     }
+    lastReconnectAttempt = millis();
   }
 
-  if (WiFi.status() != WL_CONNECTED) {
-    if (millis() - lastWifiStatusLog >= 10000) {
-      lastWifiStatusLog = millis();
-      logState("wifi_reconnect_attempt", wifiStatusName(WiFi.status()));
-    }
-    WiFi.reconnect();
-    delay(1000);
-  }
+  delay(5);
 }
