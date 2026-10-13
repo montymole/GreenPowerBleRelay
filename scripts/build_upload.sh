@@ -22,9 +22,9 @@ fi
 
 echo "Building and uploading to $PORT"
 
-if [[ "$ENVIRONMENT" == "esp32-c6-lcd-147" ]]; then
+if [[ "$ENVIRONMENT" == "esp32-c6-lcd-147" || "$ENVIRONMENT" == "esp32-c3-devkitm-1" ]]; then
   if ! command -v pio >/dev/null 2>&1; then
-    echo "PlatformIO is required for the ESP32-C6 target." >&2
+    echo "PlatformIO is required for an explicit environment." >&2
     exit 1
   fi
   pio run --environment "$ENVIRONMENT" --target upload --upload-port "$PORT"
@@ -33,7 +33,7 @@ fi
 
 if [[ -n "$ENVIRONMENT" ]]; then
   echo "Unsupported PlatformIO environment: $ENVIRONMENT" >&2
-  echo "Supported environment: esp32-c6-lcd-147" >&2
+  echo "Supported environments: esp32-c3-devkitm-1, esp32-c6-lcd-147" >&2
   exit 1
 fi
 

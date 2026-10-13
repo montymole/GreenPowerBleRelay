@@ -16,6 +16,45 @@ Edit `include/config.h`:
 For hardware details and Waveshare firmware/documentation links, see
 [`HARDWARE_ESP32-C6-LCD-1.47.md`](HARDWARE_ESP32-C6-LCD-1.47.md).
 
+## Multiple Wi-Fi networks
+
+`include/config.h` defines an ordered default list (maximum 8 networks):
+
+```cpp
+#define WIFI_NETWORKS { \
+  {"Home", "home-password"}, \
+  {"Hotspot", "hotspot-password"} \
+}
+```
+
+The existing `WIFI_SSID` and `WIFI_PASSWORD` macros supply the initial single
+entry until you edit this list. A password of `""` selects an open network.
+Each attempt has 30 seconds, then a 5-second pause before the next network.
+After the last network, attempts start again from the first. On loss of an
+established connection, that network is retried first, then rotation continues.
+
+The dashboard's **Wi-Fi networks** panel can add/remove/reorder networks and
+save them using the API key. The complete saved list overrides config.h and
+is kept in NVS across reboots and ordinary firmware/dashboard updates. Use
+**Use config.h defaults** to remove the saved override. Saving applies after
+2 seconds; an unchanged active network stays connected. If its credentials
+are changed or removed, the relay reconnects from the first network. Open the
+new IP address if the network changes. Initial access still requires one of
+the configured networks; this does not add an access-point provisioning mode.
+
+- `GET /api/v1/wifi` returns `source`, `connectedSsid` and ordered `networks`
+  with `ssid` and `hasPassword`. Passwords are never returned.
+- `PUT /api/v1/wifi` saves a complete list, authenticated with `X-Api-Key`:
+  `{"networks":[{"ssid":"Home","password":"home-password"},{"ssid":"Hotspot","password":"hotspot-password"}]}`.
+  Omit `password` to retain the existing password for that exact SSID. Explicit
+  `"password":""` selects an open network. Empty lists and duplicate SSIDs
+  are rejected. SSIDs are 1–32 bytes; passwords are 8–63 bytes or 64 hex digits.
+- `DELETE /api/v1/wifi` restores config.h defaults, authenticated with `X-Api-Key`.
+
+USB serial logging stays enabled at 115200 baud. It reports each attempted SSID,
+timeouts, disconnections and the connected SSID, IP address and signal strength.
+Passwords are not logged.
+
 ## Build and Upload
 
 ```bash
@@ -28,6 +67,15 @@ Or pass a serial port:
 ```bash
 ./scripts/build_upload.sh /dev/cu.usbserial-0001
 ```
+
+For an ESP32-C3 without a display or LEDs, use the headless PlatformIO build:
+
+```bash
+./scripts/build_upload.sh /dev/cu.usbmodem101 esp32-c3-devkitm-1
+```
+
+This target does not initialize LCD, backlight or status LED pins. Wi-Fi, BLE,
+automatic reconnection, the REST API and USB serial logs remain available.
 
 For the Waveshare ESP32-C6-LCD-1.47, use its PlatformIO environment:
 
@@ -57,17 +105,74 @@ serial monitor after startup.
 
 ### Browser dashboard
 
-Start the dependency-free local dashboard with Node.js:
+The ESP32 serves the dashboard at `http://<relay-ip>/`, with the API at
+`/api/v1/`. The dashboard always calls the API on the same origin; no server address is
+configured in the UI.
+
+Build compressed assets with Python (no npm dependencies):
 
 ```bash
-node dashboard/server.mjs
+python3 scripts/build_dashboard.py
 ```
 
-Open `http://127.0.0.1:4173`. The relay URL is prefilled with
-`http://192.168.10.130` and can be changed in the dashboard. Enter the API key
-for authenticated device and configuration changes; it remains in the current
-browser tab's session storage. Browser access from a different origin requires
-the firmware's API CORS preflight support, included in this firmware.
+Generated files go to `data/dashboard/`. PlatformIO automatically rebuilds them
+before firmware/filesystem builds. Only HTML, CSS and browser JS are packaged;
+configuration secrets and the local Node server are not included.
+
+First installation on the headless C3 (firmware plus dashboard):
+
+```bash
+./scripts/build_upload.sh /dev/cu.usbmodem101 esp32-c3-devkitm-1
+./scripts/upload_dashboard.sh /dev/cu.usbmodem101 esp32-c3-devkitm-1
+```
+
+Use `esp32-c6-lcd-147` for the display board. `upload_dashboard.sh` builds and
+uploads only the SPIFFS image; it preserves firmware and NVS device settings.
+The existing partition layout is unchanged (128 KiB SPIFFS).
+
+After installing this firmware once over USB, update either part over Wi-Fi:
+
+```bash
+# Prompts for the API key, or reads RELAY_API_KEY from the environment.
+python3 scripts/update_over_wifi.py http://192.168.1.50 --target dashboard
+python3 scripts/update_over_wifi.py http://192.168.1.50 --target firmware
+python3 scripts/update_over_wifi.py http://192.168.1.50 --target all
+# Add -e esp32-c6-lcd-147 for the C6. Default is the headless C3.
+```
+
+The script builds current sources, checks chip compatibility, uploads with an
+API key and MD5 transfer checksum, and waits for the relay after a firmware
+reboot. `--no-build` uses existing images. OTA firmware images must retain the
+same flash partition layout; changes to the partition table require USB.
+If a new firmware changes Wi-Fi credentials or the API key, subsequent access
+must use the new settings.
+
+Firmware updates use the inactive OTA application partition; unsuccessful
+uploads do not activate it. This is not automatic rollback of firmware that
+boots but behaves incorrectly. Dashboard updates overwrite the single SPIFFS
+partition: an interrupted upload can make the dashboard unavailable until it
+is uploaded again. The API and its upload endpoint remain in firmware.
+HTTP and API keys are unencrypted on the local network, so use a trusted LAN.
+
+Update API (requires a nonempty configured API key in `X-Api-Key`):
+
+- `GET /api/v1/update`: chip/filesystem identification.
+- `POST /api/v1/update/firmware`: one multipart firmware image.
+- `POST /api/v1/update/dashboard`: one multipart SPIFFS image.
+
+Uploads also require `X-Update-Size` and `X-Update-MD5`. A successful firmware
+upload reboots the device; dashboard uploads remount SPIFFS without rebooting.
+The REST API routes remain separate from the static dashboard routes.
+
+For local dashboard development, start the dependency-free local dashboard with Node.js:
+
+```bash
+RELAY_URL=http://192.168.1.50 node dashboard/server.mjs
+```
+
+Open `http://127.0.0.1:4173`. The local server proxies `/api/v1/` requests to
+`RELAY_URL`; the browser still uses same-origin requests. Enter the API key
+for authenticated changes; it remains in the current browser tab's session storage.
 
 The ESP32-C3 and ESP32-C6 PlatformIO builds enable USB CDC on boot so `Serial`
 output is available through the board's native USB serial/JTAG port.

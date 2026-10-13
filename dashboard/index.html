@@ -12,8 +12,6 @@
     <header class="topbar">
       <a class="brand" href="/">BLE<span>Relay</span></a>
       <div class="connection">
-        <label for="base-url">Relay URL</label>
-        <input id="base-url" type="url" value="http://192.168.10.130" spellcheck="false">
         <label for="api-key">API key</label>
         <input id="api-key" type="password" placeholder="Required for writes" autocomplete="off">
         <button id="save-settings" class="button secondary">Save</button>
@@ -38,6 +36,24 @@
         <article class="health-card"><span>Wi-Fi</span><strong id="wifi-state">—</strong><small id="wifi-detail">—</small></article>
         <article class="health-card"><span>GreenPower GATT</span><strong id="ble-state">—</strong><small id="ble-detail">—</small></article>
         <article class="health-card"><span>Uptime</span><strong id="uptime">—</strong><small id="last-error">Last error: —</small></article>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading">
+          <h2>Wi-Fi networks</h2>
+          <button id="reload-wifi" class="button secondary" type="button">Reload</button>
+        </div>
+        <p id="wifi-settings-state" class="muted">Loading networks…</p>
+        <p class="muted">Networks are tried from top to bottom, then repeated. Leave an existing password blank to keep it. Saving persists across reboots.</p>
+        <form id="wifi-settings-form">
+          <div id="wifi-networks"></div>
+          <div class="hero-actions">
+            <button id="add-wifi" class="button secondary" type="button">Add network</button>
+            <button class="button primary" type="submit">Save networks</button>
+            <button id="reset-wifi" class="button secondary" type="button">Use config.h defaults</button>
+          </div>
+        </form>
+        <p class="muted">Changing the active network may disconnect this page. Open the relay's new IP address after it reconnects.</p>
       </section>
 
       <div class="columns">

@@ -5,6 +5,9 @@
 #include <WebServer.h>
 #include <WiFi.h>
 #include <Preferences.h>
+#include <SPIFFS.h>
+#include <Update.h>
+#include <esp_partition.h>
 #include <string>
 #include <vector>
 #include <atomic>
@@ -13,6 +16,7 @@
 #include "../include/victron_ble.h"
 #include "status_display.h"
 #include "connection_state.h"
+#include "wifi_settings.h"
 
 static const char *SERVICE_UUID = "0000FFB0-0000-1000-8000-00805F9B34FB";
 static const char *WRITE_UUID = "0000FFB1-0000-1000-8000-00805F9B34FB";
@@ -37,6 +41,13 @@ String deviceName;
 String deviceAddress;
 uint32_t lastSeenMs = 0;
 std::atomic<bool> transactionError{false};
+std::atomic<bool> updateBusy{false};
+std::atomic<bool> updateError{false};
+bool updateFilesystem = false;
+bool updateReceived = false;
+bool updateComplete = false;
+String updateFailure;
+uint32_t restartAt = 0;
 uint32_t lastBleRetryLog = 0;
 
 static constexpr size_t MAX_CONFIGURED_DEVICES = 8;
@@ -1654,7 +1665,153 @@ static void dispatchDeviceRoute() {
   sendError(404, "not_found");
 }
 
+static void handleWifiSettings() {
+  const auto settings = wifiSettingsSnapshot();
+  String json = "{\"source\":\"" + String(wifiSettingsStored() ? "saved" : "config") +
+                "\",\"connectedSsid\":\"" + jsonEscape(WiFi.isConnected() ? WiFi.SSID() : "") + "\",\"networks\":[";
+  for (uint8_t i = 0; i < settings.count; ++i) {
+    if (i) json += ',';
+    json += "{\"ssid\":\"" + jsonEscape(settings.networks[i].ssid) + "\",\"hasPassword\":" +
+            String(settings.networks[i].password[0] ? "true" : "false") + "}";
+  }
+  sendJson(200, json + "]}");
+}
+
+static bool updateAuthorized() {
+  return strlen(API_KEY) > 0 && apiAuthorized();
+}
+
+static void failUpdate(const String &reason) {
+  updateFailure = reason;
+  updateError = true;
+  if (Update.isRunning()) Update.abort();
+}
+
+static void receiveUpdate(bool filesystem) {
+  if (!updateAuthorized()) return;
+  HTTPUpload &upload = server.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    if (updateReceived) {
+      failUpdate("Only one image per request is allowed");
+      return;
+    }
+    updateReceived = true;
+    updateComplete = false;
+    updateFilesystem = filesystem;
+    updateFailure = "";
+    updateError = false;
+    const String sizeHeader = server.header("X-Update-Size");
+    const String md5 = server.header("X-Update-MD5");
+    char *end = nullptr;
+    const unsigned long size = strtoul(sizeHeader.c_str(), &end, 10);
+    bool validMd5 = md5.length() == 32;
+    for (size_t i = 0; i < md5.length(); ++i) validMd5 &= isxdigit(md5[i]) != 0;
+    if (!size || !sizeHeader.length() || *end || !validMd5) {
+      failUpdate("Valid X-Update-Size and X-Update-MD5 headers required");
+      return;
+    }
+    if (filesystem) {
+      const auto *partition = esp_partition_find_first(
+          ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, nullptr);
+      if (!partition || size != partition->size) {
+        failUpdate("Filesystem image size does not match partition");
+        return;
+      }
+      SPIFFS.end();
+    }
+    if (!Update.begin(size, filesystem ? U_SPIFFS : U_FLASH)) {
+      failUpdate(Update.errorString());
+      return;
+    }
+    Update.setMD5(md5.c_str());
+    updateBusy = true;
+    logState("update_started", filesystem ? "dashboard" : "firmware");
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (!updateBusy || updateFailure.length()) return;
+    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+      failUpdate(Update.errorString());
+    }
+  } else if (upload.status == UPLOAD_FILE_END) {
+    updateComplete = true;
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    failUpdate("Upload interrupted");
+    if (updateFilesystem) SPIFFS.begin(false);
+    updateBusy = false;
+    updateReceived = false;
+    logState("update_aborted");
+  }
+}
+
+static void finishUpdate() {
+  if (!updateAuthorized()) {
+    sendError(401, "unauthorized");
+    return;
+  }
+  if (!updateReceived || !updateComplete) failUpdate("Incomplete upload");
+  if (!updateFailure.length() && !Update.end(false)) failUpdate(Update.errorString());
+  if (updateFilesystem && !SPIFFS.begin(false) && !updateFailure.length()) {
+    failUpdate("Dashboard filesystem could not be mounted");
+  }
+  updateBusy = false;
+  updateReceived = false;
+  updateComplete = false;
+  if (updateFailure.length()) {
+    logState("update_failed", updateFailure);
+    sendError(400, "update_failed", updateFailure);
+    return;
+  }
+  updateError = false;
+  logState("update_complete", updateFilesystem ? "dashboard" : "firmware");
+  sendJson(200, updateFilesystem ? "{\"ok\":true,\"rebooting\":false}" :
+                                 "{\"ok\":true,\"rebooting\":true}");
+  if (!updateFilesystem) restartAt = millis() + 1000;
+}
+
+static void serveDashboardAsset(const char *path, const char *contentType) {
+  File file = SPIFFS.open(path, FILE_READ);
+  if (!file) {
+    server.send(503, "text/plain", "Dashboard not installed. Run scripts/upload_dashboard.sh.");
+    return;
+  }
+  // streamFile adds Content-Encoding: gzip from the .gz filename.
+  server.sendHeader("Cache-Control", "no-store");
+  server.sendHeader("X-Content-Type-Options", "nosniff");
+  server.streamFile(file, contentType);
+  file.close();
+}
+
 static void setupRoutes() {
+  server.on("/api/v1/wifi", HTTP_GET, handleWifiSettings);
+  server.on("/api/v1/wifi", HTTP_PUT, []() {
+    if (!updateAuthorized()) { sendError(401, "unauthorized"); return; }
+    String error;
+    if (!saveWifiSettings(server.arg("plain"), error)) { sendError(400, "wifi_settings_failed", error); return; }
+    handleWifiSettings();
+  });
+  server.on("/api/v1/wifi", HTTP_DELETE, []() {
+    if (!updateAuthorized()) { sendError(401, "unauthorized"); return; }
+    String error;
+    if (!resetWifiSettings(error)) { sendError(400, "wifi_settings_failed", error); return; }
+    handleWifiSettings();
+  });
+  server.on("/api/v1/update", HTTP_GET, []() {
+    if (!updateAuthorized()) { sendError(401, "unauthorized"); return; }
+    sendJson(200, String("{\"chip\":\"") + ESP.getChipModel() + "\",\"filesystem\":\"spiffs\"}");
+  });
+  server.on("/api/v1/update/firmware", HTTP_POST, finishUpdate, []() { receiveUpdate(false); });
+  server.on("/api/v1/update/dashboard", HTTP_POST, finishUpdate, []() { receiveUpdate(true); });
+  server.on("/", HTTP_GET, []() {
+    serveDashboardAsset("/dashboard/index.html.gz", "text/html; charset=utf-8");
+  });
+  server.on("/index.html", HTTP_GET, []() {
+    serveDashboardAsset("/dashboard/index.html.gz", "text/html; charset=utf-8");
+  });
+  server.on("/styles.css", HTTP_GET, []() {
+    serveDashboardAsset("/dashboard/styles.css.gz", "text/css; charset=utf-8");
+  });
+  server.on("/app.js", HTTP_GET, []() {
+    serveDashboardAsset("/dashboard/app.js.gz", "text/javascript; charset=utf-8");
+  });
   const char *prefix = "/api/v1";
   server.on(String(prefix) + "/health", HTTP_GET, handleHealth);
   server.on(String(prefix) + "/status", HTTP_GET, handleStatus);
@@ -1716,17 +1873,39 @@ static void setupRoutes() {
 // Independent of the BLE/HTTP loop: allow each Wi-Fi attempt time to finish.
 static void connectionStatusTask(void *) {
   WifiRetryState retry;
+  WifiSettings settings{};
+  uint32_t pendingVersion = 0;
+  uint32_t pendingSince = 0;
   bool wasConnected = false;
   WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);  // Credentials are stored only in our ordered NVS list.
   WiFi.setAutoReconnect(false);  // This task is the sole retry scheduler.
   for (;;) {
+    const auto latest = wifiSettingsSnapshot();
+    if (latest.version != settings.version) {
+      if (pendingVersion != latest.version) { pendingVersion = latest.version; pendingSince = millis(); }
+      // Allow the settings HTTP response to finish before changing networks.
+      if (!settings.version || millis() - pendingSince >= 2000) {
+        int retained = -1;
+        if (WiFi.isConnected() && settings.count) {
+          const auto &old = settings.networks[retry.networkIndex()];
+          for (uint8_t i = 0; i < latest.count; ++i) {
+            if (!strcmp(old.ssid, latest.networks[i].ssid) &&
+                !strcmp(old.password, latest.networks[i].password)) retained = i;
+          }
+        }
+        if (retained < 0) { WiFi.disconnect(); wasConnected = false; }
+        settings = latest;
+        retry.reset(retained < 0 ? 0 : retained);
+      }
+    }
     const bool connected = WiFi.status() == WL_CONNECTED;
-    if (connected && !wasConnected) logState("wifi_ready", "ip=" + WiFi.localIP().toString());
+    if (connected && !wasConnected) logState("wifi_ready", "ssid=" + WiFi.SSID() + " ip=" + WiFi.localIP().toString() + " rssi=" + String(WiFi.RSSI()));
     if (!connected && wasConnected) logState("wifi_disconnected");
-    switch (retry.update(millis(), connected)) {
+    switch (retry.update(millis(), connected, settings.count)) {
       case WifiAction::Begin:
-        logState("wifi_connect_start", "ssid=" WIFI_SSID);
-        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+        logState("wifi_connect_start", "ssid=" + String(settings.networks[retry.networkIndex()].ssid));
+        WiFi.begin(settings.networks[retry.networkIndex()].ssid, settings.networks[retry.networkIndex()].password);
         break;
       case WifiAction::Reconnect:
         logState("wifi_reconnect_attempt");
@@ -1742,10 +1921,10 @@ static void connectionStatusTask(void *) {
     wasConnected = connected;
     wifiConnecting = retry.connecting();
     statusDisplayUpdate(connected, wifiConnecting,
-                        connected ? WiFi.SSID() : String(WIFI_SSID),
+                        connected ? WiFi.SSID() : String(settings.count ? settings.networks[retry.networkIndex()].ssid : "No networks"),
                         connected ? WiFi.localIP().toString() : "",
                         bleConnected, deviceReady, bleConnecting,
-                        transactionBusy || discoveryRunning, transactionError);
+                        transactionBusy || discoveryRunning || updateBusy, transactionError || updateError);
     vTaskDelay(pdMS_TO_TICKS(50));
   }
 }
@@ -1767,6 +1946,7 @@ void setup() {
 
   statusDisplayInit();
   loadDeviceRegistry();
+  loadWifiSettings();
   // This task owns Wi-Fi retries and all display writes, including while BLE blocks.
   if (xTaskCreate(connectionStatusTask, "connection-status", 4096, nullptr, 1, nullptr) != pdPASS) {
     Serial.println("[ERROR] Unable to start connection status task");
@@ -1782,8 +1962,10 @@ void setup() {
     logState("ble_not_ready", lastError);
   }
 
-  static const char *headers[] = {"X-Api-Key"};
-  server.collectHeaders(headers, 1);
+  static const char *headers[] = {"X-Api-Key", "X-Update-Size", "X-Update-MD5"};
+  // Do not format on mount failure: firmware updates must preserve dashboard files.
+  if (!SPIFFS.begin(false)) logState("dashboard_unavailable", "upload filesystem image");
+  server.collectHeaders(headers, 3);
   setupRoutes();
   server.begin();
   Serial.println("[HTTP] REST API started on port 80");
@@ -1793,7 +1975,13 @@ void setup() {
 }
 
 void loop() {
+  if (restartAt) {
+    if (static_cast<int32_t>(millis() - restartAt) >= 0) ESP.restart();
+    delay(5);
+    return;
+  }
   server.handleClient();
+  if (restartAt) return;
 
   if (!discoveryRunning && millis() - lastAdvertisementScan >= 10000) {
     lastAdvertisementScan = millis();

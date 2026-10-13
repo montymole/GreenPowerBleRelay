@@ -29,3 +29,9 @@ Thumbs.db
 *.tmp
 *.swp
 *.swo
+
+# Generated dashboard filesystem assets
+data/dashboard/
+
+# Python build/test caches
+__pycache__/

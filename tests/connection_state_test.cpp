@@ -31,6 +31,31 @@ int main() {
   assert(wrap.update(start + 30000u, false) == WifiAction::Disconnect);
   assert(wrap.update(start + 35000u, false) == WifiAction::Begin);
 
+  // Rotate through every configured network, wrap, and stay on success.
+  WifiRetryState multiple;
+  assert(multiple.update(0, false, 3) == WifiAction::Begin);
+  assert(multiple.networkIndex() == 0);
+  for (uint32_t attempt = 0; attempt < 7; ++attempt) {
+    assert(multiple.update(attempt * 35000 + 30000, false, 3) == WifiAction::Disconnect);
+    assert(multiple.networkIndex() == (attempt + 1) % 3);
+    assert(multiple.update((attempt + 1) * 35000, false, 3) == WifiAction::Begin);
+  }
+  const auto successfulIndex = multiple.networkIndex();
+  assert(multiple.update(246000, true, 3) == WifiAction::None);
+  assert(multiple.networkIndex() == successfulIndex);
+  assert(multiple.update(247000, false, 3) == WifiAction::Reconnect);
+  assert(multiple.networkIndex() == successfulIndex);
+  // Reordering an active network preserves its new index; a replacement starts at zero.
+  multiple.reset(2);
+  assert(multiple.update(250000, true, 3) == WifiAction::None);
+  assert(multiple.networkIndex() == 2);
+  multiple.reset();
+  assert(multiple.update(251000, false, 1) == WifiAction::Begin);
+  assert(multiple.networkIndex() == 0);
+  WifiRetryState empty;
+  assert(empty.update(0, false, 0) == WifiAction::None);
+  assert(!empty.connecting());
+
   // Both arrival orders: pending -> one connected -> both ready.
   assert(relayStatus(false, true, false, false, true, false, false) == RelayStatus::Working);
   assert(relayStatus(true, false, false, false, true, false, false) == RelayStatus::Working);

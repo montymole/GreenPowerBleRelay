@@ -6,7 +6,8 @@ enum class WifiAction { None, Begin, Reconnect, Disconnect };
 
 class WifiRetryState {
  public:
-  WifiAction update(uint32_t now, bool connected) {
+  WifiAction update(uint32_t now, bool connected, uint8_t networkCount = 1) {
+    if (!networkCount) { connecting_ = false; return WifiAction::None; }
     if (connected) {
       started_ = true;
       wasConnected_ = true;
@@ -22,6 +23,7 @@ class WifiRetryState {
       return action;
     }
     if (connecting_ && uint32_t(now - phaseStarted_) >= 30000) {
+      networkIndex_ = (networkIndex_ + 1) % networkCount;
       connecting_ = false;
       phaseStarted_ = now;
       return WifiAction::Disconnect;
@@ -35,12 +37,15 @@ class WifiRetryState {
   }
 
   bool connecting() const { return connecting_; }
+  uint8_t networkIndex() const { return networkIndex_; }
+  void reset(uint8_t index = 0) { *this = WifiRetryState(); networkIndex_ = index; }
 
  private:
   bool started_ = false;
   bool wasConnected_ = false;
   bool connecting_ = false;
   uint32_t phaseStarted_ = 0;
+  uint8_t networkIndex_ = 0;
 };
 
 enum class RelayStatus { Working, Ready, Error };

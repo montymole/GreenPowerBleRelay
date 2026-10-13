@@ -111,3 +111,8 @@ footer { padding: 22px 0 0; color: var(--muted); font-size: 11px; }
   .device-row { align-items: flex-start; flex-direction: column; }
   .device-actions { justify-content: flex-start; }
 }
+
+.wifi-network { display: grid; grid-template-columns: 1fr 1fr auto auto; gap: 12px; align-items: end; margin-bottom: 16px; }
+.wifi-network label { display: grid; gap: 6px; }
+.wifi-network input[type="checkbox"] { width: 20px; height: 20px; }
+@media (max-width: 760px) { .wifi-network { grid-template-columns: 1fr; } }

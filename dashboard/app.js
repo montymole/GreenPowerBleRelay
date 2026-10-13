@@ -1,23 +1,10 @@
 const API_PREFIX = "/api/v1";
-const DEFAULT_RELAY_URL = "http://192.168.10.130";
-const baseUrlInput = document.querySelector("#base-url");
 const apiKeyInput = document.querySelector("#api-key");
 const toast = document.querySelector("#toast");
 let scanPollTimer = 0;
 let toastTimer = 0;
 
-baseUrlInput.value = localStorage.getItem("relayBaseUrl") || DEFAULT_RELAY_URL;
 apiKeyInput.value = sessionStorage.getItem("relayApiKey") || "";
-
-function relayBase() {
-  const value = baseUrlInput.value.trim().replace(/\/+$/, "");
-  if (!value) throw new Error("Enter the relay URL.");
-  const parsed = new URL(value);
-  if (!["http:", "https:"].includes(parsed.protocol)) {
-    throw new Error("Relay URL must use http or https.");
-  }
-  return value;
-}
 
 function showToast(message, isError = false) {
   toast.textContent = message;
@@ -31,7 +18,7 @@ async function request(path, { method = "GET", body, auth = false } = {}) {
   const headers = { Accept: "application/json" };
   if (body !== undefined) headers["Content-Type"] = "application/json";
   if (auth && apiKeyInput.value.trim()) headers["X-Api-Key"] = apiKeyInput.value.trim();
-  const response = await fetch(`${relayBase()}${path}`, {
+  const response = await fetch(path, {
     method,
     headers,
     body: body === undefined ? undefined : JSON.stringify(body),
@@ -42,6 +29,91 @@ async function request(path, { method = "GET", body, auth = false } = {}) {
   try { data = raw ? JSON.parse(raw) : null; } catch { data = raw; }
   return { status: response.status, ok: response.ok, data };
 }
+
+function addWifiRow(network = {}) {
+  const list = document.querySelector("#wifi-networks");
+  if (list.children.length >= 8) { showToast("Up to 8 networks are supported.", true); return; }
+  const row = document.createElement("div");
+  row.className = "wifi-network";
+  const field = (labelText, name, type, value = "") => {
+    const label = document.createElement("label");
+    label.textContent = labelText;
+    const input = document.createElement("input");
+    input.name = name; input.type = type; input.value = value;
+    label.append(input); row.append(label);
+    return input;
+  };
+  const ssid = field("Network name", "ssid", "text", network.ssid || "");
+  ssid.required = true; ssid.maxLength = 32;
+  const password = field("Password", "password", "password");
+  password.maxLength = 64; password.autocomplete = "new-password";
+  password.placeholder = network.ssid ? "Unchanged" : "Network password";
+  const open = field("Open network", "open", "checkbox");
+  open.checked = network.hasPassword === false;
+  password.disabled = open.checked;
+  open.addEventListener("change", () => { password.disabled = open.checked; });
+  const controls = document.createElement("div");
+  controls.className = "hero-actions";
+  for (const [label, action] of [
+    ["↑", () => { if (row.previousElementSibling) list.insertBefore(row, row.previousElementSibling); }],
+    ["↓", () => { if (row.nextElementSibling) list.insertBefore(row.nextElementSibling, row); }],
+    ["Remove", () => row.remove()],
+  ]) {
+    const button = document.createElement("button");
+    button.type = "button"; button.className = "button secondary"; button.textContent = label;
+    button.setAttribute("aria-label", label === "↑" ? "Try this network earlier" : label === "↓" ? "Try this network later" : "Remove network");
+    button.addEventListener("click", action); controls.append(button);
+  }
+  row.append(controls); list.append(row);
+}
+
+function showWifiSettings(data) {
+  document.querySelector("#wifi-networks").replaceChildren();
+  for (const network of data.networks) addWifiRow(network);
+  document.querySelector("#wifi-settings-state").textContent =
+    `${data.source === "saved" ? "Saved on ESP32" : "Using config.h defaults"} · ${data.connectedSsid ? `Connected: ${data.connectedSsid}` : "Not connected"}`;
+}
+
+async function loadWifiSettings() {
+  try {
+    const result = await request(`${API_PREFIX}/wifi`);
+    if (!result.ok) throw new Error(result.data.message || "Could not load Wi-Fi settings");
+    showWifiSettings(result.data);
+  } catch (error) { document.querySelector("#wifi-settings-state").textContent = error.message; }
+}
+
+document.querySelector("#reload-wifi").addEventListener("click", loadWifiSettings);
+document.querySelector("#add-wifi").addEventListener("click", () => addWifiRow());
+document.querySelector("#wifi-settings-form").addEventListener("submit", async event => {
+  event.preventDefault();
+  const networks = [...document.querySelector("#wifi-networks").children].map(row => {
+    const network = { ssid: row.querySelector('[name="ssid"]').value };
+    const password = row.querySelector('[name="password"]').value;
+    if (row.querySelector('[name="open"]').checked) network.password = "";
+    else if (password) network.password = password;
+    return network;
+  });
+  if (!networks.length) { showToast("Add at least one network.", true); return; }
+  event.submitter.disabled = true;
+  try {
+    const result = await request(`${API_PREFIX}/wifi`, { method: "PUT", body: { networks }, auth: true });
+    if (!result.ok) throw new Error(result.data.message || result.data.error);
+    showWifiSettings(result.data);
+    showToast("Wi-Fi networks saved on ESP32. Connection settings apply in 2 seconds.");
+  } catch (error) { showToast(error.message, true); }
+  finally { event.submitter.disabled = false; }
+});
+document.querySelector("#reset-wifi").addEventListener("click", async event => {
+  event.currentTarget.disabled = true;
+  try {
+    const result = await request(`${API_PREFIX}/wifi`, { method: "DELETE", auth: true });
+    if (!result.ok) throw new Error(result.data.message || result.data.error);
+    showWifiSettings(result.data);
+    showToast("Using config.h networks. Connection settings apply in 2 seconds.");
+  } catch (error) { showToast(error.message, true); }
+  finally { document.querySelector("#reset-wifi").disabled = false; }
+});
+loadWifiSettings();
 
 function format(value) {
   return typeof value === "string" ? value : JSON.stringify(value, null, 2);
@@ -201,9 +273,8 @@ async function refreshAll() {
 
 document.querySelector("#save-settings").addEventListener("click", () => {
   try {
-    localStorage.setItem("relayBaseUrl", relayBase());
     sessionStorage.setItem("relayApiKey", apiKeyInput.value.trim());
-    showToast("Relay URL saved; API key kept for this browser tab.");
+    showToast("API key kept for this browser tab.");
     refreshAll();
   } catch (error) { showToast(error.message, true); }
 });
