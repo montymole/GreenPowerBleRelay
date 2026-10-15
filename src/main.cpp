@@ -4,9 +4,19 @@
 #include <BLEScan.h>
 #include <WebServer.h>
 #include <WiFi.h>
+#include <Preferences.h>
+#include <SPIFFS.h>
+#include <Update.h>
+#include <esp_partition.h>
+#include <string>
 #include <vector>
+#include <atomic>
 
 #include "../include/config.h"
+#include "../include/victron_ble.h"
+#include "status_display.h"
+#include "connection_state.h"
+#include "wifi_settings.h"
 
 static const char *SERVICE_UUID = "0000FFB0-0000-1000-8000-00805F9B34FB";
 static const char *WRITE_UUID = "0000FFB1-0000-1000-8000-00805F9B34FB";
@@ -20,14 +30,89 @@ BLERemoteCharacteristic *writeChar = nullptr;
 BLERemoteCharacteristic *notifyChar = nullptr;
 
 std::vector<uint8_t> rxBuf;
-volatile bool bleConnected = false;
-bool deviceReady = false;
-bool transactionBusy = false;
+std::atomic<bool> bleConnected{false};
+std::atomic<bool> bleConnecting{false};
+std::atomic<bool> wifiConnecting{false};
+std::atomic<bool> deviceReady{false};
+std::atomic<bool> transactionBusy{false};
 uint8_t slaveAddress = 0x02;
 String lastError;
 String deviceName;
 String deviceAddress;
 uint32_t lastSeenMs = 0;
+std::atomic<bool> transactionError{false};
+std::atomic<bool> updateBusy{false};
+std::atomic<bool> updateError{false};
+bool updateFilesystem = false;
+bool updateReceived = false;
+bool updateComplete = false;
+String updateFailure;
+uint32_t restartAt = 0;
+uint32_t lastBleRetryLog = 0;
+
+static constexpr size_t MAX_CONFIGURED_DEVICES = 8;
+static constexpr size_t MAX_DISCOVERED_DEVICES = 16;
+static constexpr size_t MAX_RECENT_LOGS = 40;
+static portMUX_TYPE deviceStateMux = portMUX_INITIALIZER_UNLOCKED;
+static portMUX_TYPE recentLogMux = portMUX_INITIALIZER_UNLOCKED;
+
+struct DeviceConfig {
+  char id[13];
+  char address[18];
+  char name[32];
+  uint8_t protocol;
+  uint8_t key[16];
+  bool hasKey;
+  bool enabled;
+};
+
+struct DeviceState {
+  char address[18];
+  uint16_t productId;
+  uint8_t recordType;
+  uint16_t counter;
+  uint32_t lastSeen;
+  int rssi;
+  uint8_t dataLength;
+  uint8_t plaintext[16];
+  bool decoded;
+};
+
+struct DiscoveredDevice {
+  char address[18];
+  char name[32];
+  uint16_t productId;
+  uint8_t protocol;
+  uint8_t recordType;
+  int rssi;
+  uint32_t lastSeen;
+  uint8_t manufacturerDataLength;
+  char manufacturerDataHex[65];
+  bool manufacturerDataTruncated;
+  bool hasGreenPowerService;
+};
+
+struct RecentLogEntry {
+  uint32_t uptimeMs;
+  char message[128];
+};
+
+DeviceConfig configuredDevices[MAX_CONFIGURED_DEVICES] = {};
+DeviceState deviceStates[MAX_CONFIGURED_DEVICES] = {};
+DiscoveredDevice discoveredDevices[MAX_DISCOVERED_DEVICES] = {};
+size_t discoveredCount = 0;
+RecentLogEntry recentLogs[MAX_RECENT_LOGS] = {};
+size_t recentLogNext = 0;
+size_t recentLogCount = 0;
+volatile uint32_t scanAdvertisementCount = 0;
+Preferences devicePreferences;
+std::atomic<bool> discoveryRunning{false};
+uint32_t discoveryStartedAt = 0;
+bool connectScanActive = false;
+uint32_t lastAdvertisementScan = 0;
+uint32_t lastVictronAdvertisementLog = 0;
+uint32_t lastAnyAdvertisementLog = 0;
+String requestedConnectAddress;
 
 struct TxResult {
   bool ok = false;
@@ -35,6 +120,40 @@ struct TxResult {
   std::vector<uint8_t> response;
   std::vector<uint16_t> registers;
 };
+
+static const char *wifiStatusName(wl_status_t status) {
+  switch (status) {
+    case WL_NO_SSID_AVAIL: return "no_ssid";
+    case WL_CONNECT_FAILED: return "connect_failed";
+    case WL_CONNECTION_LOST: return "connection_lost";
+    case WL_DISCONNECTED: return "disconnected";
+    case WL_CONNECTED: return "connected";
+    default: return "other";
+  }
+}
+
+static void logState(const char *state, const String &detail = "") {
+  const uint32_t now = millis();
+  String message = String("[STATE] ") + state;
+  if (detail.length()) message += " - " + detail;
+  char storedMessage[sizeof(recentLogs[0].message)] = {};
+  message.toCharArray(storedMessage, sizeof(storedMessage));
+
+  portENTER_CRITICAL(&recentLogMux);
+  recentLogs[recentLogNext].uptimeMs = now;
+  memcpy(recentLogs[recentLogNext].message, storedMessage, sizeof(storedMessage));
+  recentLogNext = (recentLogNext + 1) % MAX_RECENT_LOGS;
+  if (recentLogCount < MAX_RECENT_LOGS) ++recentLogCount;
+  portEXIT_CRITICAL(&recentLogMux);
+
+  Serial.print("[STATE] ");
+  Serial.print(state);
+  if (detail.length()) {
+    Serial.print(" - ");
+    Serial.print(detail);
+  }
+  Serial.println();
+}
 
 static String hexByte(uint8_t b) {
   char out[3];
@@ -46,6 +165,73 @@ static String bytesToHex(const std::vector<uint8_t> &bytes) {
   String s;
   for (uint8_t b : bytes) s += hexByte(b);
   return s;
+}
+
+static void copyText(char *target, size_t capacity, const String &value) {
+  if (!capacity) return;
+  snprintf(target, capacity, "%s", value.c_str());
+}
+
+static uint8_t hexNibble(char c);
+
+static String normalizedAddress(String address) {
+  address.toLowerCase();
+  address.replace("-", ":");
+  if (address.length() == 12) {
+    String formatted;
+    for (size_t i = 0; i < 12; i += 2) {
+      if (i) formatted += ":";
+      formatted += address.substring(i, i + 2);
+    }
+    address = formatted;
+  }
+  if (address.length() != 17) return "";
+  for (size_t i = 0; i < address.length(); ++i) {
+    if (i % 3 == 2) {
+      if (address[i] != ':') return "";
+    } else if (hexNibble(address[i]) == 0xff) {
+      return "";
+    }
+  }
+  return address;
+}
+
+static String deviceIdForAddress(const String &address) {
+  String id = address;
+  id.replace(":", "");
+  id.toLowerCase();
+  return id;
+}
+
+static int configuredDeviceIndex(const String &id) {
+  for (size_t i = 0; i < MAX_CONFIGURED_DEVICES; ++i) {
+    if (configuredDevices[i].enabled && id.equalsIgnoreCase(configuredDevices[i].id)) {
+      return static_cast<int>(i);
+    }
+  }
+  return -1;
+}
+
+static void loadDeviceRegistry() {
+  if (!devicePreferences.begin("ble-devices", false)) {
+    Serial.println("[NVS] Unable to open BLE device registry");
+    return;
+  }
+  const size_t expected = sizeof(configuredDevices);
+  if (devicePreferences.getUInt("schema", 0) == 1 &&
+      devicePreferences.getBytesLength("registry") == expected) {
+    devicePreferences.getBytes("registry", configuredDevices, expected);
+  }
+  devicePreferences.end();
+}
+
+static bool saveDeviceRegistry() {
+  if (!devicePreferences.begin("ble-devices", false)) return false;
+  const size_t written = devicePreferences.putBytes("registry", configuredDevices,
+                                                    sizeof(configuredDevices));
+  const size_t schemaWritten = devicePreferences.putUInt("schema", 1);
+  devicePreferences.end();
+  return written == sizeof(configuredDevices) && schemaWritten == sizeof(uint32_t);
 }
 
 static uint8_t hexNibble(char c) {
@@ -125,32 +311,200 @@ static void notifyCallback(BLERemoteCharacteristic *, uint8_t *data, size_t len,
   lastSeenMs = millis();
 }
 
+template <typename Data>
+static void encodeManufacturerData(const Data &data, size_t length, char (&hexOutput)[65],
+                                   bool &truncated) {
+  static const char hex[] = "0123456789ABCDEF";
+  const size_t bytesToEncode = length < 32 ? length : 32;
+  for (size_t i = 0; i < bytesToEncode; ++i) {
+    const uint8_t value = static_cast<uint8_t>(data[i]);
+    hexOutput[i * 2] = hex[value >> 4];
+    hexOutput[i * 2 + 1] = hex[value & 0x0f];
+  }
+  hexOutput[bytesToEncode * 2] = '\0';
+  truncated = length > bytesToEncode;
+}
+
+template <typename Data>
+static void recordDiscoveredDevice(const String &address, const String &name,
+                                   uint8_t protocol, uint8_t recordType, int rssi,
+                                   size_t manufacturerDataLength, bool hasGreenPowerService,
+                                   uint16_t productId, const Data &manufacturerData) {
+  const String normalized = normalizedAddress(address);
+  if (normalized.isEmpty()) return;
+  char addressText[18] = {};
+  char nameText[32] = {};
+  copyText(addressText, sizeof(addressText), normalized);
+  copyText(nameText, sizeof(nameText), name);
+
+  portENTER_CRITICAL(&deviceStateMux);
+  size_t slot = discoveredCount;
+  for (size_t i = 0; i < discoveredCount; ++i) {
+    if (strcmp(addressText, discoveredDevices[i].address) == 0) {
+      slot = i;
+      break;
+    }
+  }
+  if (slot == discoveredCount) {
+    if (discoveredCount < MAX_DISCOVERED_DEVICES) {
+      ++discoveredCount;
+    } else {
+      slot = 0;
+      for (size_t i = 1; i < discoveredCount; ++i) {
+        if (discoveredDevices[i].lastSeen < discoveredDevices[slot].lastSeen) slot = i;
+      }
+    }
+  }
+  memcpy(discoveredDevices[slot].address, addressText, sizeof(addressText));
+  memcpy(discoveredDevices[slot].name, nameText, sizeof(nameText));
+  discoveredDevices[slot].productId = productId;
+  discoveredDevices[slot].protocol = protocol;
+  discoveredDevices[slot].recordType = recordType;
+  discoveredDevices[slot].rssi = rssi;
+  discoveredDevices[slot].lastSeen = millis();
+  discoveredDevices[slot].manufacturerDataLength =
+      static_cast<uint8_t>(manufacturerDataLength > 255 ? 255 : manufacturerDataLength);
+  encodeManufacturerData(manufacturerData, manufacturerDataLength,
+                         discoveredDevices[slot].manufacturerDataHex,
+                         discoveredDevices[slot].manufacturerDataTruncated);
+  discoveredDevices[slot].hasGreenPowerService = hasGreenPowerService;
+  portEXIT_CRITICAL(&deviceStateMux);
+}
+
+static size_t manufacturerDataSize(const std::string &data) {
+  return data.size();
+}
+
+static size_t manufacturerDataSize(const String &data) {
+  return data.length();
+}
+
+static void captureAdvertisement(BLEAdvertisedDevice &advertised) {
+  const String address = advertised.getAddress().toString().c_str();
+  const String name = advertised.haveName() ? advertised.getName().c_str() : "";
+  const bool hasGreenPower = advertised.haveServiceUUID() &&
+      advertised.isAdvertisingService(BLEUUID(SERVICE_UUID));
+  const auto manufacturerData = advertised.getManufacturerData();
+  const size_t manufacturerLength = advertised.haveManufacturerData()
+      ? manufacturerDataSize(manufacturerData) : 0;
+  uint8_t protocol = hasGreenPower ? 1 : 0;
+  uint8_t recordType = 0xff;
+  uint16_t productId = 0;
+  ++scanAdvertisementCount;
+
+  if (manufacturerLength) {
+    VictronAdvertisement victron;
+    if (parseVictronAdvertisement(manufacturerData, victron)) {
+      protocol = 2;
+      productId = victron.productId;
+      recordType = victron.recordType;
+      if (lastVictronAdvertisementLog == 0 ||
+          millis() - lastVictronAdvertisementLog >= 10000) {
+        lastVictronAdvertisementLog = millis();
+        logState("victron_advertisement",
+                 address + " product=" + victronProductName(productId) +
+                     " record=" + victronRecordName(recordType) +
+                     " rssi=" + String(advertised.getRSSI()));
+      }
+
+      DeviceConfig configCopy[MAX_CONFIGURED_DEVICES];
+      portENTER_CRITICAL(&deviceStateMux);
+      memcpy(configCopy, configuredDevices, sizeof(configCopy));
+      portEXIT_CRITICAL(&deviceStateMux);
+      for (size_t i = 0; i < MAX_CONFIGURED_DEVICES; ++i) {
+        if (!configCopy[i].enabled || configCopy[i].protocol != 2 ||
+            normalizedAddress(address) != configCopy[i].address) continue;
+
+        std::vector<uint8_t> plaintext;
+        const bool decoded = configCopy[i].hasKey &&
+            decryptVictronAdvertisement(victron, configCopy[i].key, plaintext);
+        char addressText[18] = {};
+        copyText(addressText, sizeof(addressText), address);
+        portENTER_CRITICAL(&deviceStateMux);
+        memcpy(deviceStates[i].address, addressText, sizeof(addressText));
+        deviceStates[i].productId = victron.productId;
+        deviceStates[i].recordType = victron.recordType;
+        deviceStates[i].counter = victron.counter;
+        deviceStates[i].lastSeen = millis();
+        deviceStates[i].rssi = advertised.getRSSI();
+        deviceStates[i].decoded = decoded;
+        deviceStates[i].dataLength = decoded ? static_cast<uint8_t>(plaintext.size()) : 0;
+        if (decoded) memcpy(deviceStates[i].plaintext, plaintext.data(), plaintext.size());
+        portEXIT_CRITICAL(&deviceStateMux);
+        break;
+      }
+    }
+  }
+
+  recordDiscoveredDevice(address, name, protocol, recordType, advertised.getRSSI(),
+                         manufacturerLength, hasGreenPower, productId, manufacturerData);
+
+  if (lastAnyAdvertisementLog == 0 || millis() - lastAnyAdvertisementLog >= 10000) {
+    lastAnyAdvertisementLog = millis();
+    logState("ble_advertisement_seen",
+             (name.isEmpty() ? String("<unnamed>") : name) + " " + address +
+                 " rssi=" + String(advertised.getRSSI()));
+  }
+}
+
 class ScanCallbacks : public BLEAdvertisedDeviceCallbacks {
   void onResult(BLEAdvertisedDevice d) override {
+    captureAdvertisement(d);
     bool hasService = d.haveServiceUUID() && d.isAdvertisingService(BLEUUID(SERVICE_UUID));
-    bool nameOk = strlen(DEVICE_NAME_HINT) == 0 || (d.haveName() && d.getName().indexOf(DEVICE_NAME_HINT) >= 0);
-    if (hasService && nameOk) {
+    String advertisedName = d.haveName() ? String(d.getName().c_str()) : String();
+    bool nameOk = strlen(DEVICE_NAME_HINT) == 0 ||
+                  (d.haveName() && advertisedName.indexOf(DEVICE_NAME_HINT) >= 0);
+    const bool targetOk = requestedConnectAddress.isEmpty() ||
+        normalizedAddress(d.getAddress().toString().c_str()) == requestedConnectAddress;
+    if (connectScanActive && hasService && nameOk && targetOk) {
       if (foundDevice) delete foundDevice;
       foundDevice = new BLEAdvertisedDevice(d);
+      Serial.print("[BLE] Found matching device: ");
+      Serial.print(advertisedName.length() ? advertisedName : "<unnamed>");
+      Serial.print(" @ ");
+      Serial.println(d.getAddress().toString().c_str());
       BLEDevice::getScan()->stop();
     }
   }
 };
 
+static ScanCallbacks scanCallbacks;
+
+static void advertisementScanComplete(BLEScanResults) {
+  discoveryRunning = false;
+  logState("ble_scan_complete", "advertisements=" + String(scanAdvertisementCount));
+}
+
+static bool startAdvertisementScan(uint32_t durationSeconds) {
+  BLEScan *scan = BLEDevice::getScan();
+  if (discoveryRunning || connectScanActive) return false;
+  scanAdvertisementCount = 0;
+  logState("ble_scan_start", "duration=" + String(durationSeconds) + "s");
+  discoveryRunning = scan->start(durationSeconds, advertisementScanComplete, false);
+  discoveryStartedAt = millis();
+  if (!discoveryRunning) logState("ble_scan_failed", "start_failed");
+  return discoveryRunning;
+}
+
 class ClientCallbacks : public BLEClientCallbacks {
-  void onConnect(BLEClient *) override { bleConnected = true; }
+  void onConnect(BLEClient *) override {
+    bleConnected = true;
+    logState("ble_connected");
+  }
   void onDisconnect(BLEClient *) override {
     bleConnected = false;
     deviceReady = false;
-    writeChar = nullptr;
-    notifyChar = nullptr;
-    lastError = "ble_disconnected";
+    // The main task owns characteristic pointers. Clearing them here could
+    // race with an initialization write immediately after a delay.
+    logState("ble_disconnected");
   }
 };
 
 static bool connectBle() {
   deviceReady = false;
   lastError = "";
+  bleConnecting = true;
+  logState("ble_scan_start", "timeout=10s");
   rxBuf.clear();
 
   if (bleClient && bleClient->isConnected()) bleClient->disconnect();
@@ -158,34 +512,52 @@ static bool connectBle() {
   notifyChar = nullptr;
 
   BLEScan *scan = BLEDevice::getScan();
-  scan->setAdvertisedDeviceCallbacks(new ScanCallbacks(), true);
+  scan->setAdvertisedDeviceCallbacks(&scanCallbacks, true);
   scan->setActiveScan(true);
+  if (discoveryRunning) {
+    scan->stop();
+    discoveryRunning = false;
+  }
   if (foundDevice) {
     delete foundDevice;
     foundDevice = nullptr;
   }
 
+  connectScanActive = true;
   scan->start(10, false);
+  connectScanActive = false;
   scan->clearResults();
   if (!foundDevice) {
     lastError = "device_not_found";
+    logState("ble_scan_failed", lastError);
+    bleConnecting = false;
     return false;
   }
 
   deviceName = foundDevice->haveName() ? foundDevice->getName().c_str() : "";
   deviceAddress = foundDevice->getAddress().toString().c_str();
 
-  bleClient = BLEDevice::createClient();
-  bleClient->setClientCallbacks(new ClientCallbacks());
+  static ClientCallbacks clientCallbacks;
+  if (!bleClient) {
+    bleClient = BLEDevice::createClient();
+    bleClient->setClientCallbacks(&clientCallbacks);
+  }
+  logState("ble_connect_start", deviceAddress);
   if (!bleClient->connect(foundDevice)) {
     lastError = "connect_failed";
+    logState("ble_connect_failed", lastError);
+    bleConnecting = false;
     return false;
   }
   bleConnected = true;
 
+  // Refresh cached services when reconnecting or switching devices.
+  bleClient->getServices();
   BLERemoteService *service = bleClient->getService(BLEUUID(SERVICE_UUID));
   if (!service) {
     lastError = "service_missing";
+    logState("ble_setup_failed", lastError);
+    bleConnecting = false;
     return false;
   }
 
@@ -193,39 +565,70 @@ static bool connectBle() {
   notifyChar = service->getCharacteristic(BLEUUID(NOTIFY_UUID));
   if (!writeChar || !notifyChar) {
     lastError = "characteristic_missing";
+    logState("ble_setup_failed", lastError);
+    bleConnecting = false;
     return false;
   }
 
-  if (notifyChar->canNotify()) notifyChar->registerForNotify(notifyCallback);
+  if (notifyChar->canNotify()) {
+    notifyChar->registerForNotify(notifyCallback);
+    logState("ble_notifications_enabled");
+  } else {
+    lastError = "notify_not_supported";
+    logState("ble_setup_failed", lastError);
+    bleConnecting = false;
+    return false;
+  }
   delay(200);
 
+  auto stillConnected = []() {
+    if (bleConnected) return true;
+    lastError = "ble_disconnected";
+    bleConnecting = false;
+    return false;
+  };
+  if (!stillConnected()) return false;
+  logState("ble_enter_at_mode");
   writeChar->writeValue((uint8_t *)"+++", 3, false);
   delay(250);
+  if (!stillConnected()) return false;
   const char exitAt[] = "AT+exit\r\n";
+  logState("ble_exit_at_mode");
   writeChar->writeValue((uint8_t *)exitAt, sizeof(exitAt) - 1, false);
   delay(250);
+  if (!stillConnected()) return false;
 
   std::vector<uint8_t> readAddress = {0xff, 0x03, 0xf0, 0x01, 0x00, 0x01, 0xf3, 0x14};
   rxBuf.clear();
+  logState("ble_read_modbus_address");
   writeChar->writeValue(readAddress.data(), readAddress.size(), false);
 
   uint32_t start = millis();
-  while (millis() - start < 5000) {
+  while (bleConnected && millis() - start < 5000) {
     if (rxBuf.size() >= 7 && rxBuf[1] == 0x03) {
       std::vector<uint8_t> frame(rxBuf.begin(), rxBuf.begin() + 7);
       if (!crcOk(frame)) {
         lastError = "modbus_address_crc_invalid";
+        logState("ble_init_failed", lastError);
+        bleConnecting = false;
         return false;
       }
       slaveAddress = frame[0];
+      if (!bleConnected) break;
+      lastError = "";
+      transactionError = false;
       deviceReady = true;
       lastSeenMs = millis();
+      logState("ble_ready", "modbus_slave=0x" + hexByte(slaveAddress));
+      bleConnecting = false;
       return true;
     }
     delay(5);
   }
 
-  lastError = "modbus_address_timeout";
+  lastError = bleConnected ? "modbus_address_timeout" : "ble_disconnected";
+  logState("ble_init_failed", lastError);
+  bleConnecting = false;
   return false;
 }
 
@@ -233,15 +636,21 @@ static TxResult transact(const std::vector<uint8_t> &request, uint8_t expectedFu
   TxResult r;
   if (!deviceReady || !bleConnected || !writeChar) {
     r.error = "ble_not_ready";
+    logState("modbus_rejected", r.error);
     return r;
   }
   if (transactionBusy) {
     r.error = "busy";
+    logState("modbus_rejected", r.error);
     return r;
   }
   transactionBusy = true;
   rxBuf.clear();
 
+  Serial.printf("[MODBUS] request function=0x%02X address=0x%04X bytes=%u\n",
+                request.size() > 1 ? request[1] : 0,
+                request.size() > 3 ? (request[2] << 8) | request[3] : 0,
+                (unsigned)request.size());
   writeChar->writeValue((uint8_t *)request.data(), request.size(), false);
   uint32_t start = millis();
 
@@ -268,15 +677,24 @@ static TxResult transact(const std::vector<uint8_t> &request, uint8_t expectedFu
 
       if (!crcOk(r.response)) {
         r.error = "crc_invalid";
+        logState("modbus_failed", r.error);
+        lastError = r.error;
+        transactionError = true;
         transactionBusy = false;
         return r;
       }
       if (r.response[1] & 0x80) {
         r.error = "modbus_exception";
+        logState("modbus_failed", r.error);
+        lastError = r.error;
+        transactionError = true;
         transactionBusy = false;
         return r;
       }
       r.ok = true;
+      lastError = "";
+      transactionError = false;
+      Serial.printf("[MODBUS] response ok bytes=%u\n", (unsigned)r.response.size());
       transactionBusy = false;
       return r;
     }
@@ -284,6 +702,10 @@ static TxResult transact(const std::vector<uint8_t> &request, uint8_t expectedFu
   }
 
   r.error = "timeout";
+  lastError = r.error;
+  transactionError = true;
+  deviceReady = false;  // Reinitialize an unresponsive GATT/Modbus connection.
+  logState("modbus_failed", r.error);
   transactionBusy = false;
   return r;
 }
@@ -306,6 +728,8 @@ static void sendJson(int code, const String &json);
 static void sendError(int code, const String &err, const String &msg = "");
 static int errCode(const String &err);
 static String regsJson(const std::vector<uint16_t> &regs);
+static void handleLive();
+static bool liveJson(String &json, String &error);
 
 static bool parseJsonNumber(const String &body, const char *name, float &value) {
   String key = "\"" + String(name) + "\"";
@@ -532,6 +956,9 @@ static bool isWritable(uint16_t a) {
 
 static void sendJson(int code, const String &json) {
   server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type, X-Api-Key");
+  server.sendHeader("Access-Control-Max-Age", "600");
   server.send(code, "application/json", json);
 }
 
@@ -556,6 +983,425 @@ static String regsJson(const std::vector<uint16_t> &regs) {
   return s;
 }
 
+static bool apiAuthorized() {
+  return server.header("X-Api-Key") == API_KEY;
+}
+
+static String jsonEscape(const String &value) {
+  String escaped;
+  for (size_t i = 0; i < value.length(); ++i) {
+    const uint8_t c = static_cast<uint8_t>(value[i]);
+    if (c == '"' || c == '\\') escaped += '\\';
+    if (c == '\n') escaped += "\\n";
+    else if (c == '\r') escaped += "\\r";
+    else if (c == '\t') escaped += "\\t";
+    else if (c < 0x20) {
+      static const char hex[] = "0123456789ABCDEF";
+      escaped += "\\u00";
+      escaped += hex[c >> 4];
+      escaped += hex[c & 0x0f];
+    }
+    else escaped += static_cast<char>(c);
+  }
+  return escaped;
+}
+
+static bool jsonStringField(const String &body, const char *name, String &value, bool &present) {
+  const String key = "\"" + String(name) + "\"";
+  int position = body.indexOf(key);
+  present = position >= 0;
+  if (!present) return true;
+  position = body.indexOf(':', position + key.length());
+  if (position < 0) return false;
+  do { ++position; } while (position < static_cast<int>(body.length()) && isspace(body[position]));
+  if (position >= static_cast<int>(body.length()) || body[position] != '"') return false;
+  const int start = ++position;
+  while (position < static_cast<int>(body.length())) {
+    if (body[position] == '\\') return false;
+    if (body[position] == '"') {
+      value = body.substring(start, position);
+      return true;
+    }
+    ++position;
+  }
+  return false;
+}
+
+static bool parseVictronKey(const String &text, uint8_t key[16]) {
+  if (text.length() != 32) return false;
+  for (size_t i = 0; i < 16; ++i) {
+    const uint8_t high = hexNibble(text[i * 2]);
+    const uint8_t low = hexNibble(text[i * 2 + 1]);
+    if (high == 0xff || low == 0xff) return false;
+    key[i] = static_cast<uint8_t>((high << 4) | low);
+  }
+  return true;
+}
+
+static String protocolName(uint8_t protocol) {
+  if (protocol == 2) return "victron";
+  if (protocol == 1) return "greenpower";
+  return "other";
+}
+
+static String configuredDeviceJson(size_t index) {
+  DeviceConfig config;
+  DeviceState state;
+  portENTER_CRITICAL(&deviceStateMux);
+  config = configuredDevices[index];
+  state = deviceStates[index];
+  portEXIT_CRITICAL(&deviceStateMux);
+
+  String json = "{\"id\":\"" + String(config.id) + "\",\"address\":\"" +
+      String(config.address) + "\",\"name\":\"" + jsonEscape(String(config.name)) +
+      "\",\"protocol\":\"" + protocolName(config.protocol) + "\",\"enabled\":" +
+      String(config.enabled ? "true" : "false") + ",\"keyConfigured\":" +
+      String(config.hasKey ? "true" : "false") + ",\"lastSeenMs\":" +
+      String(state.lastSeen) + ",\"rssi\":" + String(state.rssi);
+  if (config.protocol == 2) {
+    json += ",\"capabilities\":[\"telemetry\"]";
+    json += ",\"transport\":\"ble_advertisement\",\"productId\":" +
+        String(state.productId) + ",\"productName\":\"" +
+        jsonEscape(victronProductName(state.productId)) + "\",\"productType\":\"";
+    json += state.lastSeen ? victronRecordName(state.recordType) : "unknown";
+    json += "\",\"decoded\":";
+    json += state.decoded ? "true" : "false";
+  } else {
+    const bool connected = deviceAddress.equalsIgnoreCase(config.address) && bleConnected;
+    json += ",\"capabilities\":[\"telemetry\",\"registers\",\"write\",\"reconnect\"]";
+    json += ",\"transport\":\"gatt\",\"connected\":";
+    json += connected ? "true" : "false";
+    json += ",\"ready\":";
+    json += connected && deviceReady ? "true" : "false";
+  }
+  json += "}";
+  return json;
+}
+
+static void handleDevicesList() {
+  String json = "{\"devices\":[";
+  bool first = true;
+  for (size_t i = 0; i < MAX_CONFIGURED_DEVICES; ++i) {
+    if (!configuredDevices[i].enabled) continue;
+    if (!first) json += ",";
+    json += configuredDeviceJson(i);
+    first = false;
+  }
+  json += "],\"limit\":" + String(MAX_CONFIGURED_DEVICES) + "}";
+  sendJson(200, json);
+}
+
+static void handleDeviceCreate() {
+  if (!apiAuthorized()) {
+    sendError(401, "unauthorized");
+    return;
+  }
+
+  const String body = server.arg("plain");
+  String address, name, protocol, keyText;
+  bool hasAddress, hasName, hasProtocol, hasKey;
+  if (!jsonStringField(body, "address", address, hasAddress) ||
+      !jsonStringField(body, "name", name, hasName) ||
+      !jsonStringField(body, "protocol", protocol, hasProtocol) ||
+      !jsonStringField(body, "key", keyText, hasKey) ||
+      !hasAddress || !hasProtocol) {
+    sendError(400, "bad_request", "Expected address and protocol string fields");
+    return;
+  }
+
+  address = normalizedAddress(address);
+  protocol.toLowerCase();
+  const uint8_t protocolId = protocol == "victron" ? 2 :
+      (protocol == "greenpower" ? 1 : 0);
+  uint8_t key[16] = {};
+  if (address.isEmpty() || protocolId == 0 ||
+      (hasKey && !parseVictronKey(keyText, key)) ||
+      (hasKey && protocolId != 2)) {
+    sendError(400, "bad_request", "Invalid address, protocol, or 32-character hexadecimal Victron key");
+    return;
+  }
+
+  int freeSlot = -1;
+  for (size_t i = 0; i < MAX_CONFIGURED_DEVICES; ++i) {
+    if (configuredDevices[i].enabled &&
+        address.equalsIgnoreCase(configuredDevices[i].address)) {
+      sendError(409, "device_exists");
+      return;
+    }
+    if (!configuredDevices[i].enabled && freeSlot < 0) freeSlot = static_cast<int>(i);
+  }
+  if (freeSlot < 0) {
+    sendError(409, "device_limit_reached");
+    return;
+  }
+
+  const String id = deviceIdForAddress(address);
+  DeviceConfig config = {};
+  copyText(config.id, sizeof(config.id), id);
+  copyText(config.address, sizeof(config.address), address);
+  if (hasName) copyText(config.name, sizeof(config.name), name);
+  config.protocol = protocolId;
+  config.hasKey = hasKey;
+  config.enabled = true;
+  if (hasKey) memcpy(config.key, key, sizeof(key));
+
+  portENTER_CRITICAL(&deviceStateMux);
+  configuredDevices[freeSlot] = config;
+  deviceStates[freeSlot] = {};
+  portEXIT_CRITICAL(&deviceStateMux);
+  if (!saveDeviceRegistry()) {
+    portENTER_CRITICAL(&deviceStateMux);
+    configuredDevices[freeSlot] = {};
+    portEXIT_CRITICAL(&deviceStateMux);
+    sendError(500, "storage_failed");
+    return;
+  }
+
+  sendJson(201, configuredDeviceJson(freeSlot));
+}
+
+static void handleDeviceDetail(const String &id) {
+  const int index = configuredDeviceIndex(id);
+  if (index < 0) {
+    sendError(404, "device_not_found");
+    return;
+  }
+  sendJson(200, configuredDeviceJson(index));
+}
+
+static void handleDeviceUpdate(const String &id) {
+  if (!apiAuthorized()) {
+    sendError(401, "unauthorized");
+    return;
+  }
+  const int index = configuredDeviceIndex(id);
+  if (index < 0) {
+    sendError(404, "device_not_found");
+    return;
+  }
+
+  const String body = server.arg("plain");
+  String name, keyText;
+  bool hasName, hasKey;
+  uint8_t key[16] = {};
+  if (!jsonStringField(body, "name", name, hasName) ||
+      !jsonStringField(body, "key", keyText, hasKey) ||
+      (!hasName && !hasKey) || (hasKey && !parseVictronKey(keyText, key))) {
+    sendError(400, "bad_request", "Expected name and/or a 32-character hexadecimal key");
+    return;
+  }
+  if (hasKey && configuredDevices[index].protocol != 2) {
+    sendError(400, "key_not_supported_for_protocol");
+    return;
+  }
+
+  char nameText[sizeof(configuredDevices[index].name)] = {};
+  if (hasName) copyText(nameText, sizeof(nameText), name);
+  DeviceConfig previous = configuredDevices[index];
+  DeviceState previousDeviceState = deviceStates[index];
+  uint8_t previousKey[16];
+  memcpy(previousKey, configuredDevices[index].key, sizeof(previousKey));
+  portENTER_CRITICAL(&deviceStateMux);
+  if (hasName) memcpy(configuredDevices[index].name, nameText, sizeof(nameText));
+  if (hasKey) {
+    memcpy(configuredDevices[index].key, key, sizeof(key));
+    configuredDevices[index].hasKey = true;
+    deviceStates[index].decoded = false;
+  }
+  portEXIT_CRITICAL(&deviceStateMux);
+  if (!saveDeviceRegistry()) {
+    portENTER_CRITICAL(&deviceStateMux);
+    configuredDevices[index] = previous;
+    memcpy(configuredDevices[index].key, previousKey, sizeof(previousKey));
+    deviceStates[index] = previousDeviceState;
+    portEXIT_CRITICAL(&deviceStateMux);
+    sendError(500, "storage_failed");
+    return;
+  }
+  sendJson(200, configuredDeviceJson(index));
+}
+
+static void handleDeviceDelete(const String &id) {
+  if (!apiAuthorized()) {
+    sendError(401, "unauthorized");
+    return;
+  }
+  const int index = configuredDeviceIndex(id);
+  if (index < 0) {
+    sendError(404, "device_not_found");
+    return;
+  }
+  const bool isActive = deviceAddress.equalsIgnoreCase(configuredDevices[index].address);
+  DeviceConfig previous = configuredDevices[index];
+  DeviceState previousState = deviceStates[index];
+  portENTER_CRITICAL(&deviceStateMux);
+  configuredDevices[index] = {};
+  deviceStates[index] = {};
+  portEXIT_CRITICAL(&deviceStateMux);
+  if (!saveDeviceRegistry()) {
+    portENTER_CRITICAL(&deviceStateMux);
+    configuredDevices[index] = previous;
+    deviceStates[index] = previousState;
+    portEXIT_CRITICAL(&deviceStateMux);
+    sendError(500, "storage_failed");
+    return;
+  }
+  if (isActive && bleClient && bleClient->isConnected()) bleClient->disconnect();
+  sendJson(200, "{\"deleted\":true}");
+}
+
+static void handleDiscoveryStart() {
+  uint32_t durationSeconds = 30;
+  if (server.hasArg("durationSeconds")) {
+    const String durationText = server.arg("durationSeconds");
+    bool validDuration = !durationText.isEmpty() && durationText.length() <= 2;
+    for (size_t i = 0; i < durationText.length(); ++i) {
+      if (!isDigit(durationText[i])) validDuration = false;
+    }
+    const long requestedDuration = durationText.toInt();
+    if (!validDuration || requestedDuration < 1 || requestedDuration > 60) {
+      sendError(400, "bad_request", "durationSeconds must be between 1 and 60");
+      return;
+    }
+    durationSeconds = static_cast<uint32_t>(requestedDuration);
+  }
+
+  if (discoveryRunning || connectScanActive) {
+    sendError(409, "scan_busy");
+    return;
+  }
+  portENTER_CRITICAL(&deviceStateMux);
+  memset(discoveredDevices, 0, sizeof(discoveredDevices));
+  discoveredCount = 0;
+  portEXIT_CRITICAL(&deviceStateMux);
+  lastAnyAdvertisementLog = 0;
+
+  if (!startAdvertisementScan(durationSeconds)) {
+    sendError(409, "scan_busy");
+    return;
+  }
+  sendJson(202, "{\"scanning\":true,\"durationSeconds\":" + String(durationSeconds) + "}");
+}
+
+static void handleDiscoveryResults() {
+  String json = "{\"scanning\":" + String(discoveryRunning ? "true" : "false") +
+                ",\"advertisementCount\":" + String(scanAdvertisementCount) +
+                ",\"devices\":[";
+  portENTER_CRITICAL(&deviceStateMux);
+  const size_t count = discoveredCount;
+  DiscoveredDevice copy[MAX_DISCOVERED_DEVICES];
+  memcpy(copy, discoveredDevices, sizeof(copy));
+  portEXIT_CRITICAL(&deviceStateMux);
+  for (size_t i = 0; i < count; ++i) {
+    if (i) json += ",";
+    json += "{\"id\":\"" + deviceIdForAddress(copy[i].address) +
+        "\",\"address\":\"" + String(copy[i].address) + "\",\"name\":\"" +
+        jsonEscape(String(copy[i].name)) + "\",\"protocol\":\"" +
+        protocolName(copy[i].protocol) + "\",\"rssi\":" + String(copy[i].rssi) +
+        ",\"lastSeenMs\":" + String(copy[i].lastSeen) +
+        ",\"manufacturerDataLength\":" + String(copy[i].manufacturerDataLength) +
+        ",\"manufacturerDataHex\":\"" + String(copy[i].manufacturerDataHex) +
+        "\",\"manufacturerDataTruncated\":" +
+        String(copy[i].manufacturerDataTruncated ? "true" : "false") +
+        ",\"greenPowerService\":" + String(copy[i].hasGreenPowerService ? "true" : "false");
+    if (copy[i].protocol == 2) {
+      json += ",\"productId\":" + String(copy[i].productId);
+      json += ",\"productName\":\"" + jsonEscape(victronProductName(copy[i].productId));
+      json += "\",\"productType\":\"";
+      json += victronRecordName(copy[i].recordType);
+      const int index = configuredDeviceIndex(deviceIdForAddress(copy[i].address));
+      json += "\",\"keyRequired\":";
+      json += index < 0 || !configuredDevices[index].hasKey ? "true" : "false";
+    }
+    json += "}";
+  }
+  json += "]}";
+  sendJson(200, json);
+}
+
+static void handleRecentLogs() {
+  size_t requestedLimit = MAX_RECENT_LOGS;
+  if (server.hasArg("limit")) {
+    const String limitText = server.arg("limit");
+    bool validLimit = !limitText.isEmpty() && limitText.length() <= 2;
+    for (size_t i = 0; i < limitText.length(); ++i) {
+      if (!isDigit(limitText[i])) validLimit = false;
+    }
+    const long parsedLimit = limitText.toInt();
+    if (!validLimit || parsedLimit < 1 || parsedLimit > MAX_RECENT_LOGS) {
+      sendError(400, "bad_request", "limit must be between 1 and 40");
+      return;
+    }
+    requestedLimit = static_cast<size_t>(parsedLimit);
+  }
+
+  static RecentLogEntry snapshot[MAX_RECENT_LOGS] = {};
+  portENTER_CRITICAL(&recentLogMux);
+  const size_t count = recentLogCount < requestedLimit ? recentLogCount : requestedLimit;
+  const size_t first = (recentLogNext + MAX_RECENT_LOGS - count) % MAX_RECENT_LOGS;
+  for (size_t i = 0; i < count; ++i) {
+    snapshot[i] = recentLogs[(first + i) % MAX_RECENT_LOGS];
+  }
+  portEXIT_CRITICAL(&recentLogMux);
+
+  String json = "{\"logs\":[";
+  for (size_t i = 0; i < count; ++i) {
+    if (i) json += ",";
+    json += "{\"uptimeMs\":" + String(snapshot[i].uptimeMs) +
+        ",\"message\":\"" + jsonEscape(String(snapshot[i].message)) + "\"}";
+  }
+  json += "],\"count\":" + String(count) + ",\"limit\":" + String(requestedLimit) + "}";
+  sendJson(200, json);
+}
+
+static void handleDeviceTelemetry(const String &id) {
+  const int index = configuredDeviceIndex(id);
+  if (index < 0) {
+    sendError(404, "device_not_found");
+    return;
+  }
+  DeviceConfig config;
+  DeviceState state;
+  portENTER_CRITICAL(&deviceStateMux);
+  config = configuredDevices[index];
+  state = deviceStates[index];
+  portEXIT_CRITICAL(&deviceStateMux);
+
+  if (config.protocol == 1) {
+    if (!deviceAddress.equalsIgnoreCase(config.address) || !deviceReady) {
+      sendError(503, "device_not_connected");
+      return;
+    }
+    String data, error;
+    if (!liveJson(data, error)) {
+      sendError(errCode(error), error);
+      return;
+    }
+    sendJson(200, "{\"id\":\"" + String(config.id) +
+             "\",\"protocol\":\"greenpower\",\"transport\":\"gatt\",\"available\":true,\"data\":" +
+             data + "}");
+    return;
+  }
+
+  String json = "{\"id\":\"" + String(config.id) + "\",\"protocol\":\"victron\"";
+  json += ",\"transport\":\"ble_advertisement\",\"keyConfigured\":";
+  json += config.hasKey ? "true" : "false";
+  json += ",\"available\":";
+  json += state.decoded ? "true" : "false";
+  json += ",\"lastSeenMs\":" + String(state.lastSeen) + ",\"rssi\":" + String(state.rssi);
+  if (!config.hasKey) {
+    json += ",\"decodeError\":\"key_required\",\"data\":null}";
+  } else if (!state.decoded) {
+    json += ",\"decodeError\":\"not_seen_or_key_mismatch\",\"data\":null}";
+  } else {
+    std::vector<uint8_t> plaintext(state.plaintext, state.plaintext + state.dataLength);
+    json += ",\"decodeError\":null,\"data\":";
+    json += victronTelemetryJson(state.recordType, plaintext);
+    json += "}";
+  }
+  sendJson(200, json);
+}
+
 static void handleStatus() {
   String json = "{";
   json += "\"wifi\":{\"connected\":" + String(WiFi.isConnected() ? "true" : "false");
@@ -565,8 +1411,46 @@ static void handleStatus() {
   json += ",\"deviceName\":\"" + deviceName + "\",\"deviceAddress\":\"" + deviceAddress + "\"";
   json += ",\"modbusAddress\":" + String(slaveAddress) + ",\"lastSeenMs\":" + String(lastSeenMs) + "},";
   json += "\"lastError\":" + String(lastError.length() ? "\"" + lastError + "\"" : "null");
+  json += ",\"devices\":[";
+  bool first = true;
+  for (size_t i = 0; i < MAX_CONFIGURED_DEVICES; ++i) {
+    if (!configuredDevices[i].enabled) continue;
+    if (!first) json += ",";
+    json += configuredDeviceJson(i);
+    first = false;
+  }
+  json += "]";
   json += "}";
   sendJson(200, json);
+}
+
+static void handleHealth() {
+  bool deviceHealthy = bleConnected && deviceReady;
+  for (size_t i = 0; i < MAX_CONFIGURED_DEVICES; ++i) {
+    if (!configuredDevices[i].enabled) continue;
+    if (configuredDevices[i].protocol == 2 &&
+        deviceStates[i].decoded &&
+        millis() - deviceStates[i].lastSeen <= 30000) {
+      deviceHealthy = true;
+    }
+  }
+  bool healthy = WiFi.isConnected() && deviceHealthy;
+  String json = "{";
+  json += "\"healthy\":" + String(healthy ? "true" : "false");
+  json += ",\"uptimeMs\":" + String(millis());
+  json += ",\"wifiConnected\":" + String(WiFi.isConnected() ? "true" : "false");
+  json += ",\"wifiStatus\":\"" + String(wifiStatusName(WiFi.status())) + "\"";
+  json += ",\"bleConnected\":" + String(bleConnected ? "true" : "false");
+  json += ",\"bleReady\":" + String(deviceReady ? "true" : "false");
+  json += ",\"deviceCount\":";
+  size_t deviceCount = 0;
+  for (size_t i = 0; i < MAX_CONFIGURED_DEVICES; ++i) {
+    if (configuredDevices[i].enabled) ++deviceCount;
+  }
+  json += String(deviceCount);
+  json += ",\"lastError\":" + String(lastError.length() ? "\"" + lastError + "\"" : "null");
+  json += "}";
+  sendJson(healthy ? 200 : 503, json);
 }
 
 static void handleRegistersRead() {
@@ -590,16 +1474,16 @@ static void handleRegistersRead() {
   sendJson(200, json);
 }
 
-static void handleLive() {
+static bool liveJson(String &json, String &error) {
   TxResult a = readRegisters(0x0003, 28);
   if (!a.ok) {
-    sendError(errCode(a.error), a.error);
-    return;
+    error = a.error;
+    return false;
   }
   TxResult b = readRegisters(0x0027, 25);
   if (!b.ok) {
-    sendError(errCode(b.error), b.error);
-    return;
+    error = b.error;
+    return false;
   }
 
   auto reg = [](const std::vector<uint16_t> &v, size_t i) -> uint16_t {
@@ -612,15 +1496,17 @@ static void handleLive() {
   float pvCurrent = reg(a.registers, 8) / 10.0f;
   float fanVoltage = reg(a.registers, 9) / 10.0f;
   float fanCurrent = reg(a.registers, 10) / 10.0f;
-  float workTemp = (reg(a.registers, 12) - 500) / 10.0f;
-  float battTemp = (reg(a.registers, 13) - 500) / 10.0f;
+  auto temperatureJson = [](uint16_t raw) -> String {
+    // 9999 means disabled (battery) or abnormal (work temperature).
+    return raw == 9999 ? String("null") : String((raw - 500) / 10.0f, 1);
+  };
 
-  String json = "{";
+  json = "{";
   json += "\"battery\":{\"status\":" + String(reg(a.registers, 1));
   json += ",\"percent\":" + String(reg(a.registers, 2));
   json += ",\"voltage\":" + String(batteryVoltage, 1);
   json += ",\"current\":" + String(batteryCurrent, 1);
-  json += ",\"temperature\":" + String(battTemp, 1);
+  json += ",\"temperature\":" + temperatureJson(reg(a.registers, 13));
   json += ",\"power\":" + String(reg(b.registers, 2)) + "},";
   json += "\"pv\":{\"day\":" + String(reg(a.registers, 6) ? "true" : "false");
   json += ",\"voltage\":" + String(pvVoltage, 1);
@@ -635,8 +1521,17 @@ static void handleLive() {
   json += "\"output\":{\"voltage\":" + String(reg(a.registers, 27) / 10.0f, 1);
   json += ",\"power\":" + String(reg(b.registers, 3)) + "},";
   json += "\"system\":{\"errorCode\":" + String(reg(a.registers, 0));
-  json += ",\"workTemperature\":" + String(workTemp, 1) + "}";
+  json += ",\"workTemperature\":" + temperatureJson(reg(a.registers, 12)) + "}";
   json += "}";
+  return true;
+}
+
+static void handleLive() {
+  String json, error;
+  if (!liveJson(json, error)) {
+    sendError(errCode(error), error);
+    return;
+  }
   sendJson(200, json);
 }
 
@@ -680,10 +1575,252 @@ static void handleReconnect() {
   handleStatus();
 }
 
+static bool isActiveGreenPowerDevice(int index) {
+  return index >= 0 && configuredDevices[index].protocol == 1 &&
+         deviceAddress.equalsIgnoreCase(configuredDevices[index].address) &&
+         bleConnected && deviceReady;
+}
+
+static void dispatchDeviceRoute() {
+  const String prefix = "/api/v1/devices/";
+  const String uri = server.uri();
+  String remainder = uri.substring(prefix.length());
+  const int slash = remainder.indexOf('/');
+  const String id = slash < 0 ? remainder : remainder.substring(0, slash);
+  const String operation = slash < 0 ? "" : remainder.substring(slash + 1);
+  const int index = configuredDeviceIndex(id);
+
+  if (slash < 0) {
+    if (server.method() == HTTP_GET) handleDeviceDetail(id);
+    else if (server.method() == HTTP_PUT || server.method() == HTTP_PATCH) handleDeviceUpdate(id);
+    else if (server.method() == HTTP_DELETE) handleDeviceDelete(id);
+    else sendError(405, "method_not_allowed");
+    return;
+  }
+  if (index < 0) {
+    sendError(404, "device_not_found");
+    return;
+  }
+  if (operation == "telemetry" && server.method() == HTTP_GET) {
+    handleDeviceTelemetry(id);
+    return;
+  }
+  if (operation == "reconnect" && server.method() == HTTP_POST) {
+    if (configuredDevices[index].protocol != 1) {
+      sendError(405, "advertisement_only");
+      return;
+    }
+    requestedConnectAddress = configuredDevices[index].address;
+    const bool connected = connectBle();
+    requestedConnectAddress = "";
+    if (!connected) {
+      sendError(503, lastError);
+      return;
+    }
+    handleStatus();
+    return;
+  }
+  if (operation == "registers" && server.method() == HTTP_GET) {
+    if (!isActiveGreenPowerDevice(index)) {
+      sendError(503, "device_not_connected");
+      return;
+    }
+    handleRegistersRead();
+    return;
+  }
+  if (operation.startsWith("registers/") && server.method() == HTTP_PUT) {
+    if (!apiAuthorized()) {
+      sendError(401, "unauthorized");
+      return;
+    }
+    if (!isActiveGreenPowerDevice(index)) {
+      sendError(503, "device_not_connected");
+      return;
+    }
+    handleWriteRegister();
+    return;
+  }
+  if (operation.startsWith("config/")) {
+    const String kind = operation.substring(7);
+    uint16_t start = 0;
+    uint16_t count = 0;
+    if (kind == "battery") { start = 0x1001; count = 10; }
+    else if (kind == "system") { start = 0x100b; count = 5; }
+    else if (kind == "pv") { start = 0x2001; count = 5; }
+    else if (kind == "fan") { start = 0x3001; count = 14; }
+    else if (kind == "output") { start = 0x4001; count = 31; }
+    else {
+      sendError(404, "config_not_found");
+      return;
+    }
+    if (!isActiveGreenPowerDevice(index)) {
+      sendError(503, "device_not_connected");
+      return;
+    }
+    if (server.method() == HTTP_GET) handleConfigRead(kind.c_str(), start, count);
+    else if (server.method() == HTTP_PUT) handleConfigWrite(kind.c_str(), start, count);
+    else sendError(405, "method_not_allowed");
+    return;
+  }
+  sendError(404, "not_found");
+}
+
+static void handleWifiSettings() {
+  const auto settings = wifiSettingsSnapshot();
+  String json = "{\"source\":\"" + String(wifiSettingsStored() ? "saved" : "config") +
+                "\",\"connectedSsid\":\"" + jsonEscape(WiFi.isConnected() ? WiFi.SSID() : "") + "\",\"networks\":[";
+  for (uint8_t i = 0; i < settings.count; ++i) {
+    if (i) json += ',';
+    json += "{\"ssid\":\"" + jsonEscape(settings.networks[i].ssid) + "\",\"hasPassword\":" +
+            String(settings.networks[i].password[0] ? "true" : "false") + "}";
+  }
+  sendJson(200, json + "]}");
+}
+
+static bool updateAuthorized() {
+  return strlen(API_KEY) > 0 && apiAuthorized();
+}
+
+static void failUpdate(const String &reason) {
+  updateFailure = reason;
+  updateError = true;
+  if (Update.isRunning()) Update.abort();
+}
+
+static void receiveUpdate(bool filesystem) {
+  if (!updateAuthorized()) return;
+  HTTPUpload &upload = server.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    if (updateReceived) {
+      failUpdate("Only one image per request is allowed");
+      return;
+    }
+    updateReceived = true;
+    updateComplete = false;
+    updateFilesystem = filesystem;
+    updateFailure = "";
+    updateError = false;
+    const String sizeHeader = server.header("X-Update-Size");
+    const String md5 = server.header("X-Update-MD5");
+    char *end = nullptr;
+    const unsigned long size = strtoul(sizeHeader.c_str(), &end, 10);
+    bool validMd5 = md5.length() == 32;
+    for (size_t i = 0; i < md5.length(); ++i) validMd5 &= isxdigit(md5[i]) != 0;
+    if (!size || !sizeHeader.length() || *end || !validMd5) {
+      failUpdate("Valid X-Update-Size and X-Update-MD5 headers required");
+      return;
+    }
+    if (filesystem) {
+      const auto *partition = esp_partition_find_first(
+          ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, nullptr);
+      if (!partition || size != partition->size) {
+        failUpdate("Filesystem image size does not match partition");
+        return;
+      }
+      SPIFFS.end();
+    }
+    if (!Update.begin(size, filesystem ? U_SPIFFS : U_FLASH)) {
+      failUpdate(Update.errorString());
+      return;
+    }
+    Update.setMD5(md5.c_str());
+    updateBusy = true;
+    logState("update_started", filesystem ? "dashboard" : "firmware");
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (!updateBusy || updateFailure.length()) return;
+    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+      failUpdate(Update.errorString());
+    }
+  } else if (upload.status == UPLOAD_FILE_END) {
+    updateComplete = true;
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    failUpdate("Upload interrupted");
+    if (updateFilesystem) SPIFFS.begin(false);
+    updateBusy = false;
+    updateReceived = false;
+    logState("update_aborted");
+  }
+}
+
+static void finishUpdate() {
+  if (!updateAuthorized()) {
+    sendError(401, "unauthorized");
+    return;
+  }
+  if (!updateReceived || !updateComplete) failUpdate("Incomplete upload");
+  if (!updateFailure.length() && !Update.end(false)) failUpdate(Update.errorString());
+  if (updateFilesystem && !SPIFFS.begin(false) && !updateFailure.length()) {
+    failUpdate("Dashboard filesystem could not be mounted");
+  }
+  updateBusy = false;
+  updateReceived = false;
+  updateComplete = false;
+  if (updateFailure.length()) {
+    logState("update_failed", updateFailure);
+    sendError(400, "update_failed", updateFailure);
+    return;
+  }
+  updateError = false;
+  logState("update_complete", updateFilesystem ? "dashboard" : "firmware");
+  sendJson(200, updateFilesystem ? "{\"ok\":true,\"rebooting\":false}" :
+                                 "{\"ok\":true,\"rebooting\":true}");
+  if (!updateFilesystem) restartAt = millis() + 1000;
+}
+
+static void serveDashboardAsset(const char *path, const char *contentType) {
+  File file = SPIFFS.open(path, FILE_READ);
+  if (!file) {
+    server.send(503, "text/plain", "Dashboard not installed. Run scripts/upload_dashboard.sh.");
+    return;
+  }
+  // streamFile adds Content-Encoding: gzip from the .gz filename.
+  server.sendHeader("Cache-Control", "no-store");
+  server.sendHeader("X-Content-Type-Options", "nosniff");
+  server.streamFile(file, contentType);
+  file.close();
+}
+
 static void setupRoutes() {
+  server.on("/api/v1/wifi", HTTP_GET, handleWifiSettings);
+  server.on("/api/v1/wifi", HTTP_PUT, []() {
+    if (!updateAuthorized()) { sendError(401, "unauthorized"); return; }
+    String error;
+    if (!saveWifiSettings(server.arg("plain"), error)) { sendError(400, "wifi_settings_failed", error); return; }
+    handleWifiSettings();
+  });
+  server.on("/api/v1/wifi", HTTP_DELETE, []() {
+    if (!updateAuthorized()) { sendError(401, "unauthorized"); return; }
+    String error;
+    if (!resetWifiSettings(error)) { sendError(400, "wifi_settings_failed", error); return; }
+    handleWifiSettings();
+  });
+  server.on("/api/v1/update", HTTP_GET, []() {
+    if (!updateAuthorized()) { sendError(401, "unauthorized"); return; }
+    sendJson(200, String("{\"chip\":\"") + ESP.getChipModel() + "\",\"filesystem\":\"spiffs\"}");
+  });
+  server.on("/api/v1/update/firmware", HTTP_POST, finishUpdate, []() { receiveUpdate(false); });
+  server.on("/api/v1/update/dashboard", HTTP_POST, finishUpdate, []() { receiveUpdate(true); });
+  server.on("/", HTTP_GET, []() {
+    serveDashboardAsset("/dashboard/index.html.gz", "text/html; charset=utf-8");
+  });
+  server.on("/index.html", HTTP_GET, []() {
+    serveDashboardAsset("/dashboard/index.html.gz", "text/html; charset=utf-8");
+  });
+  server.on("/styles.css", HTTP_GET, []() {
+    serveDashboardAsset("/dashboard/styles.css.gz", "text/css; charset=utf-8");
+  });
+  server.on("/app.js", HTTP_GET, []() {
+    serveDashboardAsset("/dashboard/app.js.gz", "text/javascript; charset=utf-8");
+  });
   const char *prefix = "/api/v1";
+  server.on(String(prefix) + "/health", HTTP_GET, handleHealth);
   server.on(String(prefix) + "/status", HTTP_GET, handleStatus);
+  server.on(String(prefix) + "/logs", HTTP_GET, handleRecentLogs);
   server.on(String(prefix) + "/ble/reconnect", HTTP_POST, handleReconnect);
+  server.on(String(prefix) + "/ble/discovery", HTTP_POST, handleDiscoveryStart);
+  server.on(String(prefix) + "/ble/discovery", HTTP_GET, handleDiscoveryResults);
+  server.on(String(prefix) + "/devices", HTTP_GET, handleDevicesList);
+  server.on(String(prefix) + "/devices", HTTP_POST, handleDeviceCreate);
   server.on(String(prefix) + "/registers", HTTP_GET, handleRegistersRead);
   server.on(String(prefix) + "/live", HTTP_GET, handleLive);
   server.on(String(prefix) + "/config/battery", HTTP_GET, []() {
@@ -717,50 +1854,151 @@ static void setupRoutes() {
     handleConfigWrite("output", 0x4001, 31);
   });
   server.onNotFound([]() {
-    if (server.method() == HTTP_PUT && server.uri().startsWith("/api/v1/registers/")) {
+    if (server.method() == HTTP_OPTIONS && server.uri().startsWith("/api/v1/")) {
+      server.sendHeader("Access-Control-Allow-Origin", "*");
+      server.sendHeader("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
+      server.sendHeader("Access-Control-Allow-Headers", "Content-Type, X-Api-Key");
+      server.sendHeader("Access-Control-Max-Age", "600");
+      server.send(204);
+    } else if (server.method() == HTTP_PUT && server.uri().startsWith("/api/v1/registers/")) {
       handleWriteRegister();
+    } else if (server.uri().startsWith("/api/v1/devices/")) {
+      dispatchDeviceRoute();
     } else {
       sendError(404, "not_found");
     }
   });
 }
 
+// Independent of the BLE/HTTP loop: allow each Wi-Fi attempt time to finish.
+static void connectionStatusTask(void *) {
+  WifiRetryState retry;
+  WifiSettings settings{};
+  uint32_t pendingVersion = 0;
+  uint32_t pendingSince = 0;
+  bool wasConnected = false;
+  WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);  // Credentials are stored only in our ordered NVS list.
+  WiFi.setAutoReconnect(false);  // This task is the sole retry scheduler.
+  for (;;) {
+    const auto latest = wifiSettingsSnapshot();
+    if (latest.version != settings.version) {
+      if (pendingVersion != latest.version) { pendingVersion = latest.version; pendingSince = millis(); }
+      // Allow the settings HTTP response to finish before changing networks.
+      if (!settings.version || millis() - pendingSince >= 2000) {
+        int retained = -1;
+        if (WiFi.isConnected() && settings.count) {
+          const auto &old = settings.networks[retry.networkIndex()];
+          for (uint8_t i = 0; i < latest.count; ++i) {
+            if (!strcmp(old.ssid, latest.networks[i].ssid) &&
+                !strcmp(old.password, latest.networks[i].password)) retained = i;
+          }
+        }
+        if (retained < 0) { WiFi.disconnect(); wasConnected = false; }
+        settings = latest;
+        retry.reset(retained < 0 ? 0 : retained);
+      }
+    }
+    const bool connected = WiFi.status() == WL_CONNECTED;
+    if (connected && !wasConnected) logState("wifi_ready", "ssid=" + WiFi.SSID() + " ip=" + WiFi.localIP().toString() + " rssi=" + String(WiFi.RSSI()));
+    if (!connected && wasConnected) logState("wifi_disconnected");
+    switch (retry.update(millis(), connected, settings.count)) {
+      case WifiAction::Begin:
+        logState("wifi_connect_start", "ssid=" + String(settings.networks[retry.networkIndex()].ssid));
+        WiFi.begin(settings.networks[retry.networkIndex()].ssid, settings.networks[retry.networkIndex()].password);
+        break;
+      case WifiAction::Reconnect:
+        logState("wifi_reconnect_attempt");
+        WiFi.reconnect();
+        break;
+      case WifiAction::Disconnect:
+        logState("wifi_connect_timeout", wifiStatusName(WiFi.status()));
+        WiFi.disconnect();
+        break;
+      case WifiAction::None:
+        break;
+    }
+    wasConnected = connected;
+    wifiConnecting = retry.connecting();
+    statusDisplayUpdate(connected, wifiConnecting,
+                        connected ? WiFi.SSID() : String(settings.count ? settings.networks[retry.networkIndex()].ssid : "No networks"),
+                        connected ? WiFi.localIP().toString() : "",
+                        bleConnected, deviceReady, bleConnecting,
+                        transactionBusy || discoveryRunning || updateBusy, transactionError || updateError);
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
+
 void setup() {
   Serial.begin(115200);
-  delay(500);
-
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.print("Wi-Fi connecting");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
+  uint32_t serialWaitStart = millis();
+  while (!Serial && millis() - serialWaitStart < 5000) {
+    delay(10);
   }
+  delay(250);
   Serial.println();
-  Serial.print("Wi-Fi IP: ");
-  Serial.println(WiFi.localIP());
+  Serial.println("========================================");
+  Serial.println("GreenPower ESP32 BLE REST Relay");
+  Serial.println("Firmware starting");
+  Serial.println("========================================");
+  Serial.flush();
+  logState("boot", "serial=115200");
 
+  statusDisplayInit();
+  loadDeviceRegistry();
+  loadWifiSettings();
+  // This task owns Wi-Fi retries and all display writes, including while BLE blocks.
+  if (xTaskCreate(connectionStatusTask, "connection-status", 4096, nullptr, 1, nullptr) != pdPASS) {
+    Serial.println("[ERROR] Unable to start connection status task");
+    delay(1000);
+    ESP.restart();
+  }
+
+  logState("ble_init");
   BLEDevice::init("greenpower-rest-relay");
-  connectBle();
+  BLEDevice::getScan()->setAdvertisedDeviceCallbacks(&scanCallbacks, true);
+  BLEDevice::getScan()->setActiveScan(true);
+  if (!connectBle()) {
+    logState("ble_not_ready", lastError);
+  }
 
-  static const char *headers[] = {"X-Api-Key"};
-  server.collectHeaders(headers, 1);
+  static const char *headers[] = {"X-Api-Key", "X-Update-Size", "X-Update-MD5"};
+  // Do not format on mount failure: firmware updates must preserve dashboard files.
+  if (!SPIFFS.begin(false)) logState("dashboard_unavailable", "upload filesystem image");
+  server.collectHeaders(headers, 3);
   setupRoutes();
   server.begin();
-  Serial.println("REST API started");
+  Serial.println("[HTTP] REST API started on port 80");
+  Serial.println("[HTTP] Health: GET /api/v1/health");
+  Serial.println("[HTTP] Status: GET /api/v1/status");
+  logState("startup_complete");
 }
 
 void loop() {
+  if (restartAt) {
+    if (static_cast<int32_t>(millis() - restartAt) >= 0) ESP.restart();
+    delay(5);
+    return;
+  }
   server.handleClient();
+  if (restartAt) return;
+
+  if (!discoveryRunning && millis() - lastAdvertisementScan >= 10000) {
+    lastAdvertisementScan = millis();
+    startAdvertisementScan(5);
+  }
 
   static uint32_t lastReconnectAttempt = 0;
   if ((!bleConnected || !deviceReady) && millis() - lastReconnectAttempt > 15000) {
+    if (millis() - lastBleRetryLog >= 15000) {
+      lastBleRetryLog = millis();
+      logState("ble_reconnect_attempt", lastError);
+    }
+    if (connectBle()) {
+      logState("ble_reconnect_success");
+    }
     lastReconnectAttempt = millis();
-    connectBle();
   }
 
-  if (WiFi.status() != WL_CONNECTED) {
-    WiFi.reconnect();
-    delay(1000);
-  }
+  delay(5);
 }
